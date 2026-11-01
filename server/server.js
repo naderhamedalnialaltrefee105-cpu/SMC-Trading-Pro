@@ -1,105 +1,116 @@
 
-"use strict";
+'use strict';
 
-/*
- * SMC Trading Pro
- * Server + BiQuote + Technical Analysis + Telegram
- * Markets: XAUUSD, XAGUSD
- * Node.js 20+
- */
-
-const http = require("http");
+const http = require('http');
 
 const PORT = Number(process.env.PORT || 3000);
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
-const BIQUOTE_API_URL = (
-  process.env.BIQUOTE_API_URL || "https://biquote.io/api"
-).replace(/\/+$/, "");
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+const BIQUOTE_API_URL = (process.env.BIQUOTE_API_URL || 'https://biquote.io/api').replace(/\/+$/, '');
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
-
-const SYMBOLS = ["XAUUSD", "XAGUSD"];
+const SYMBOLS = ['XAUUSD', 'XAGUSD'];
+const INTERVALS = ['1m', '5m', '15m', '30m', '1h', '4h', '1d'];
 const MAX_QUOTE_AGE_SECONDS = 120;
-const POLL_INTERVAL_MS = 60000;
 const CANDLE_LIMIT = 150;
-const SIGNAL_HISTORY_LIMIT = 200;
-
-const INTERVALS = [
-  "1m", "5m", "15m", "30m", "1h", "4h", "1d"
-];
-
-const INTERVAL_MS = {
-  "1m": 60000,
-  "3m": 180000,
-  "5m": 300000,
-  "15m": 900000,
-  "30m": 1800000,
-  "1h": 3600000,
-  "4h": 14400000,
-  "1d": 86400000
-};
-
-let signals = [];
-let lastUpdate = null;
-let lastAnalysisUpdate = null;
+const POLL_INTERVAL_MS = 60000;
+const SIGNAL_COOLDOWN_MS = 15 * 60 * 1000;
 
 const quoteCache = new Map();
 const candleCache = new Map();
-const lastProcessedBar = new Map();
-const lastSignalTime = new Map();
 const analysisCache = new Map();
+const signals = [];
+const lastSignalBySymbol = new Map();
+const lastProcessedBar = new Map();
 
-let analysisRunning = false;
+let engineBusy = false;
+let lastEngineRun = null;
 
-// ---------- HTTP HELPERS ----------
-
-function sendJSON(res, statusCode, data) {
-  res.writeHead(statusCode, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, x-webhook-secret"
+function json(res, status, data) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-webhook-secret'
   });
-
   res.end(JSON.stringify(data));
 }
 
-function getStatus() {
-  return {
-    status: "running",
-    provider: "biquote",
-    providerConfigured: Boolean(BIQUOTE_API_URL),
-    telegramConfigured: Boolean(
-      TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID
-    ),
-    analysisEngineReady: true,
-    markets: SYMBOLS,
-    lastUpdate,
-    lastAnalysisUpdate,
-    maxQuoteAgeSeconds: MAX_QUOTE_AGE_SECONDS,
-    serverTime: new Date().toISOString()
-  };
+function isNumber(value) {
+  return Number.isFinite(Number(value));
+}
+
+function average(values) {
+  if (!values.length) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function ema(values, period) {
+  if (values.length < period) return null;
+
+  const multiplier = 2 / (period + 1);
+  let result = average(values.slice(0, period));
+
+  for (let i = period; i < values.length; i++) {
+    result = (values[i] - result) * multiplier + result;
+  }
+
+  return result;
+}
+
+function calculateATR(bars, period = 14) {
+  if (bars.length < period + 1) return null;
+
+  const ranges = [];
+
+  for (let i = 1; i < bars.length; i++) {
+    const current = bars[i];
+    const previous = bars[i - 1];
+
+    ranges.push(Math.max(
+      current.high - current.low,
+      Math.abs(current.high - previous.close),
+      Math.abs(current.low - previous.close)
+    ));
+  }
+
+  return average(ranges.slice(-period));
+}
+
+function calculateRSI(closes, period = 14) {
+  if (closes.length <= period) return null;
+
+  let gains = 0;
+  let losses = 0;
+
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const change = closes[i] - closes[i - 1];
+
+    if (change > 0) gains += change;
+    else losses += Math.abs(change);
+  }
+
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+
+  if (avgLoss === 0) return 100;
+
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
 }
 
 async function fetchJSON(url) {
   const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      Accept: "application/json"
-    },
     signal: AbortSignal.timeout(12000),
-    cache: "no-store"
+    headers: { Accept: 'application/json' }
   });
 
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
+    throw new Error(`BiQuote HTTP ${response.status}`);
   }
 
   return response.json();
 }
-
-// ---------- MARKET QUOTES ----------
 
 async function getQuote(symbol) {
   const cached = quoteCache.get(symbol);
@@ -108,366 +119,219 @@ async function getQuote(symbol) {
     return cached.data;
   }
 
-  const data = await fetchJSON(
-    `${BIQUOTE_API_URL}/${symbol}`
-  );
+  try {
+    const raw = await fetchJSON(`${BIQUOTE_API_URL}/${symbol}`);
 
-  const bid = Number(data.bid);
-  const ask = Number(data.ask);
-  const age = Number(data.quoteAgeSeconds);
+    const bid = Number(raw.bid);
+    const ask = Number(raw.ask);
+    const mid = Number(raw.mid);
 
-  const validPrices =
-    Number.isFinite(bid) &&
-    Number.isFinite(ask) &&
-    bid > 0 &&
-    ask > 0 &&
-    ask >= bid;
+    const validPrices =
+      Number.isFinite(bid) &&
+      Number.isFinite(ask) &&
+      Number.isFinite(mid) &&
+      bid > 0 &&
+      ask > 0 &&
+      mid > 0 &&
+      ask >= bid;
 
-  const marketOpen =
-    String(data.marketState || "").toLowerCase() === "open";
+    const quoteAgeSeconds = Number(raw.quoteAgeSeconds);
+    const marketOpen = String(raw.marketState || '').toLowerCase() === 'open';
+    const fresh =
+      raw.stale !== true &&
+      Number.isFinite(quoteAgeSeconds) &&
+      quoteAgeSeconds <= MAX_QUOTE_AGE_SECONDS;
 
-  const fresh =
-    Number.isFinite(age) &&
-    age >= 0 &&
-    age <= MAX_QUOTE_AGE_SECONDS &&
-    data.stale !== true;
+    const data = {
+      symbol,
+      bid: validPrices ? bid : null,
+      ask: validPrices ? ask : null,
+      mid: validPrices ? mid : null,
+      validPrices,
+      marketState: raw.marketState || 'unknown',
+      marketOpen,
+      stale: raw.stale === true,
+      quoteAgeSeconds: Number.isFinite(quoteAgeSeconds) ? quoteAgeSeconds : null,
+      fresh,
+      tradable: validPrices && marketOpen && fresh,
+      lastQuoteAt: raw.lastQuoteAt || null,
+      dayDiffPercent: isNumber(raw.dayDiffPercent) ? Number(raw.dayDiffPercent) : null,
+      direction: raw.direction || 'UNKNOWN',
+      high: isNumber(raw.high) ? Number(raw.high) : null,
+      low: isNumber(raw.low) ? Number(raw.low) : null,
+      source: raw.source || 'BiQuote',
+      exchange: raw.exchange || null,
+      updatedAt: new Date().toISOString()
+    };
 
-  const quote = {
-    symbol,
-    description: data.description || symbol,
-    bid: validPrices ? bid : null,
-    ask: validPrices ? ask : null,
-    mid: validPrices ? (bid + ask) / 2 : null,
-    high: Number.isFinite(Number(data.high))
-      ? Number(data.high)
-      : null,
-    low: Number.isFinite(Number(data.low))
-      ? Number(data.low)
-      : null,
-    direction: data.direction || "UNKNOWN",
-    dayDiffPercent: Number(data.dayDiffPercent) || 0,
-    spread: validPrices ? ask - bid : null,
-    timestamp: data.timestamp || null,
-    lastQuoteAt: data.lastQuoteAt || null,
-    quoteAgeSeconds: Number.isFinite(age) ? age : null,
-    marketState: data.marketState || "unknown",
-    stale: data.stale === true,
-    exchange: data.exchange || null,
-    source: data.source || "BiQuote",
-    validPrices,
-    marketOpen,
-    fresh,
-    tradable: validPrices && marketOpen && fresh
-  };
+    quoteCache.set(symbol, { time: Date.now(), data });
+    return data;
+  } catch (error) {
+    if (cached) {
+      return {
+        ...cached.data,
+        tradable: false,
+        fresh: false,
+        error: error.message
+      };
+    }
 
-  quoteCache.set(symbol, {
-    time: Date.now(),
-    data: quote
-  });
-
-  return quote;
+    return {
+      symbol,
+      validPrices: false,
+      marketOpen: false,
+      fresh: false,
+      tradable: false,
+      marketState: 'unavailable',
+      error: error.message
+    };
+  }
 }
 
 async function getMarketData() {
-  const results = await Promise.all(
-    SYMBOLS.map(async symbol => {
-      try {
-        return await getQuote(symbol);
-      } catch (error) {
-        return {
-          symbol,
-          available: false,
-          error: error.message,
-          validPrices: false,
-          marketOpen: false,
-          fresh: false,
-          tradable: false
-        };
-      }
-    })
-  );
-
-  lastUpdate = new Date().toISOString();
+  const markets = await Promise.all(SYMBOLS.map(getQuote));
 
   return {
-    available: results.some(item => item.validPrices),
-    provider: "biquote",
-    fetchedAt: lastUpdate,
-    maxQuoteAgeSeconds: MAX_QUOTE_AGE_SECONDS,
-    allMarketsTradable:
-      results.length === SYMBOLS.length &&
-      results.every(item => item.tradable),
-    markets: results
+    markets,
+    allMarketsTradable: markets.every(market => market.tradable),
+    timestamp: new Date().toISOString()
   };
 }
 
-// ---------- CANDLE DATA ----------
-
-async function getCandles(symbol, interval, limit = CANDLE_LIMIT) {
-  const key = `${symbol}:${interval}`;
+async function getCandles(symbol, interval) {
+  const key = `${symbol}_${interval}`;
   const cached = candleCache.get(key);
 
   if (cached && Date.now() - cached.time < 30000) {
     return cached.bars;
   }
 
-  const params = new URLSearchParams({
-    interval,
-    limit: String(limit)
-  });
+  const url =
+    `${BIQUOTE_API_URL}/${symbol}/ohlc?interval=${encodeURIComponent(interval)}&limit=${CANDLE_LIMIT}`;
 
-  const data = await fetchJSON(
-    `${BIQUOTE_API_URL}/${symbol}/ohlc?${params}`
-  );
+  const raw = await fetchJSON(url);
+  const sourceBars = Array.isArray(raw.bars) ? raw.bars : [];
 
-  if (!Array.isArray(data.bars)) {
-    throw new Error(
-      `Invalid candle response for ${symbol} ${interval}`
-    );
-  }
-
-  const bars = data.bars
-    .filter(bar =>
-      Number.isFinite(Number(bar.open)) &&
-      Number.isFinite(Number(bar.high)) &&
-      Number.isFinite(Number(bar.low)) &&
-      Number.isFinite(Number(bar.close)) &&
-      bar.openTime
-    )
+  const bars = sourceBars
+    .filter(bar => bar && bar.isOpen !== true)
     .map(bar => ({
-      openTime: bar.openTime,
       time: new Date(bar.openTime).getTime(),
       open: Number(bar.open),
       high: Number(bar.high),
       low: Number(bar.low),
       close: Number(bar.close),
-      volume: Number(bar.volume) || 0,
-      tickVolume: Number(bar.tickVolume) || 0,
-      isOpen: bar.isOpen === true
+      volume: Number(bar.volume || 0),
+      tickVolume: Number(bar.tickVolume || 0)
     }))
-    .filter(bar => Number.isFinite(bar.time))
-    .filter(bar => !bar.isOpen)
+    .filter(bar =>
+      Number.isFinite(bar.time) &&
+      Number.isFinite(bar.open) &&
+      Number.isFinite(bar.high) &&
+      Number.isFinite(bar.low) &&
+      Number.isFinite(bar.close) &&
+      bar.open > 0 &&
+      bar.high >= bar.low &&
+      bar.high >= Math.max(bar.open, bar.close) &&
+      bar.low <= Math.min(bar.open, bar.close)
+    )
     .sort((a, b) => a.time - b.time);
 
-  candleCache.set(key, {
-    time: Date.now(),
-    bars
-  });
+  if (!bars.length) {
+    throw new Error(`لا توجد شموع مكتملة: ${symbol} ${interval}`);
+  }
 
+  candleCache.set(key, { time: Date.now(), bars });
   return bars;
 }
 
-// ---------- THREE-MINUTE CANDLES ----------
-
 function buildThreeMinuteCandles(oneMinuteBars) {
+  const result = [];
   const groups = new Map();
 
   for (const bar of oneMinuteBars) {
-    const bucket = Math.floor(
-      bar.time / INTERVAL_MS["3m"]
-    ) * INTERVAL_MS["3m"];
+    const bucket = Math.floor(bar.time / 180000) * 180000;
 
-    if (!groups.has(bucket)) {
-      groups.set(bucket, []);
-    }
-
+    if (!groups.has(bucket)) groups.set(bucket, []);
     groups.get(bucket).push(bar);
   }
 
-  const result = [];
-
-  for (const [time, group] of groups) {
+  for (const [time, group] of groups.entries()) {
     group.sort((a, b) => a.time - b.time);
 
-    // لا نستخدم مجموعة ناقصة من ثلاث شموع.
     if (group.length !== 3) continue;
 
-    const expected = [
-      time,
-      time + 60000,
-      time + 120000
-    ];
-
-    const complete = expected.every(
-      (value, index) => group[index].time === value
-    );
-
-    if (!complete) continue;
+    const first = group[0];
+    const last = group[2];
 
     result.push({
-      openTime: new Date(time).toISOString(),
       time,
-      open: group[0].open,
+      open: first.open,
       high: Math.max(...group.map(bar => bar.high)),
       low: Math.min(...group.map(bar => bar.low)),
-      close: group[2].close,
-      volume: group.reduce(
-        (sum, bar) => sum + bar.volume,
-        0
-      ),
-      tickVolume: group.reduce(
-        (sum, bar) => sum + bar.tickVolume,
-        0
-      ),
-      isOpen: false
+      close: last.close,
+      volume: group.reduce((sum, bar) => sum + bar.volume, 0),
+      tickVolume: group.reduce((sum, bar) => sum + bar.tickVolume, 0)
     });
   }
 
-  return result;
-}
-
-// ---------- TECHNICAL INDICATORS ----------
-
-function ema(values, period) {
-  if (values.length < period) return null;
-
-  const multiplier = 2 / (period + 1);
-
-  let result = values
-    .slice(0, period)
-    .reduce((sum, value) => sum + value, 0) / period;
-
-  for (let i = period; i < values.length; i++) {
-    result =
-      values[i] * multiplier +
-      result * (1 - multiplier);
-  }
-
-  return result;
-}
-
-function calculateRSI(values, period = 14) {
-  if (values.length <= period) return null;
-
-  let gains = 0;
-  let losses = 0;
-
-  for (let i = 1; i <= period; i++) {
-    const change = values[i] - values[i - 1];
-
-    if (change > 0) gains += change;
-    else losses += Math.abs(change);
-  }
-
-  let averageGain = gains / period;
-  let averageLoss = losses / period;
-
-  for (let i = period + 1; i < values.length; i++) {
-    const change = values[i] - values[i - 1];
-
-    averageGain =
-      (averageGain * (period - 1) + Math.max(change, 0)) /
-      period;
-
-    averageLoss =
-      (averageLoss * (period - 1) + Math.max(-change, 0)) /
-      period;
-  }
-
-  if (averageLoss === 0) return 100;
-
-  const rs = averageGain / averageLoss;
-
-  return 100 - 100 / (1 + rs);
-}
-
-function calculateATR(bars, period = 14) {
-  if (bars.length <= period) return null;
-
-  const ranges = [];
-
-  for (let i = 1; i < bars.length; i++) {
-    const current = bars[i];
-    const previous = bars[i - 1];
-
-    ranges.push(
-      Math.max(
-        current.high - current.low,
-        Math.abs(current.high - previous.close),
-        Math.abs(current.low - previous.close)
-      )
-    );
-  }
-
-  const recent = ranges.slice(-period);
-
-  return recent.reduce((sum, value) => sum + value, 0) /
-    recent.length;
+  return result.sort((a, b) => a.time - b.time);
 }
 
 function calculateTrend(bars) {
-  if (!Array.isArray(bars) || bars.length < 55) {
+  if (!bars || bars.length < 55) {
     return {
-      trend: "unknown",
-      strength: null,
-      ema20: null,
-      ema50: null,
-      rsi: null,
-      atr: null
+      available: false,
+      trend: 'غير متاح',
+      strength: 0,
+      reason: 'بيانات الشموع غير كافية'
     };
   }
 
   const closes = bars.map(bar => bar.close);
-
   const ema20 = ema(closes, 20);
   const ema50 = ema(closes, 50);
-  const rsi = calculateRSI(closes, 14);
   const atr = calculateATR(bars, 14);
+  const rsi = calculateRSI(closes, 14);
 
-  const last = closes[closes.length - 1];
-
-  if (
-    ema20 === null ||
-    ema50 === null ||
-    atr === null ||
-    !Number.isFinite(rsi)
-  ) {
+  if (!ema20 || !ema50 || !atr || !Number.isFinite(rsi)) {
     return {
-      trend: "unknown",
-      strength: null,
-      ema20,
-      ema50,
-      rsi,
-      atr
+      available: false,
+      trend: 'غير متاح',
+      strength: 0,
+      reason: 'تعذر حساب المؤشرات'
     };
   }
 
-  const difference = Math.abs(ema20 - ema50);
-  const strength = Math.min(
-    100,
-    Math.round((difference / atr) * 100)
-  );
+  const gap = Math.abs(ema20 - ema50);
+  const strength = Math.min(100, Math.round((gap / atr) * 100));
 
-  let trend = "ranging";
+  let trend = 'متذبذب';
 
-  if (ema20 > ema50 && last > ema20 && rsi >= 50) {
-    trend = "bullish";
+  if (ema20 > ema50 && closes[closes.length - 1] > ema20 && rsi >= 50) {
+    trend = 'صاعد';
   } else if (
     ema20 < ema50 &&
-    last < ema20 &&
+    closes[closes.length - 1] < ema20 &&
     rsi <= 50
   ) {
-    trend = "bearish";
+    trend = 'هابط';
   }
 
   return {
+    available: true,
     trend,
     strength,
     ema20,
     ema50,
+    atr,
     rsi,
-    atr
+    price: closes[closes.length - 1]
   };
 }
 
-// ---------- MARKET LEVELS ----------
-
 function calculateLevels(bars) {
-  if (!bars || bars.length < 20) {
-    return {
-      support: null,
-      resistance: null
-    };
+  if (!bars || bars.length < 10) {
+    return { support: null, resistance: null };
   }
 
   const recent = bars.slice(-50);
@@ -478,692 +342,533 @@ function calculateLevels(bars) {
   };
 }
 
-// ---------- MULTI-TIMEFRAME ANALYSIS ----------
-
 async function analyzeSymbol(symbol) {
-  const result = {
-    symbol,
-    available: false,
-    trend: "unknown",
-    strength: null,
-    condition: "unknown",
-    timeframes: {},
-    indicators: {},
-    levels: {},
-    candleCounts: {},
-    error: null
-  };
+  const results = await Promise.allSettled(
+    INTERVALS.map(interval => getCandles(symbol, interval))
+  );
 
-  try {
-    const candleResults = await Promise.all(
-      INTERVALS.map(async interval => ({
-        interval,
-        bars: await getCandles(symbol, interval)
-      }))
-    );
+  const candles = {};
+  const timeframes = {};
 
-    const data = {};
+  INTERVALS.forEach((interval, index) => {
+    const result = results[index];
 
-    for (const item of candleResults) {
-      data[item.interval] = item.bars;
-    }
-
-    data["3m"] = buildThreeMinuteCandles(data["1m"]);
-
-    for (const interval of [
-      "1m", "3m", "5m", "15m",
-      "30m", "1h", "4h", "1d"
-    ]) {
-      const bars = data[interval] || [];
-      const metrics = calculateTrend(bars);
-
-      result.timeframes[interval] = metrics.trend;
-      result.candleCounts[interval] = bars.length;
-
-      if (interval === "5m") {
-        result.indicators = {
-          ema20: metrics.ema20,
-          ema50: metrics.ema50,
-          rsi: metrics.rsi,
-          atr: metrics.atr
-        };
-
-        result.levels = calculateLevels(bars);
-      }
-    }
-
-    const fiveMinute = calculateTrend(data["5m"]);
-    const fifteenMinute = calculateTrend(data["15m"]);
-    const hourly = calculateTrend(data["1h"]);
-
-    result.trend = fiveMinute.trend;
-    result.strength = fiveMinute.strength;
-    result.condition = fiveMinute.trend === "ranging"
-      ? "ranging"
-      : fiveMinute.trend;
-
-    result.available =
-      fiveMinute.trend !== "unknown";
-
-    result.candles = data;
-
-    if (
-      fifteenMinute.trend !== "unknown" &&
-      hourly.trend !== "unknown"
-    ) {
-      result.confirmation = {
-        "15m": fifteenMinute.trend,
-        "1h": hourly.trend
+    if (result.status === 'fulfilled') {
+      candles[interval] = result.value;
+      timeframes[interval] = calculateTrend(result.value);
+      timeframes[interval].candleCount = result.value.length;
+    } else {
+      candles[interval] = [];
+      timeframes[interval] = {
+        available: false,
+        trend: 'غير متاح',
+        strength: 0,
+        reason: result.reason?.message || 'تعذر جلب البيانات'
       };
     }
+  });
 
-  } catch (error) {
-    result.error = error.message;
-  }
+  candles['3m'] = buildThreeMinuteCandles(candles['1m']);
+  timeframes['3m'] = calculateTrend(candles['3m']);
+  timeframes['3m'].candleCount = candles['3m'].length;
 
-  analysisCache.set(symbol, result);
+  const mainBars = candles['5m'];
+  const levels = calculateLevels(mainBars);
 
-  return result;
+  const available = mainBars.length >= 60 &&
+    candles['15m'].length >= 55;
+
+  const mainTrend = timeframes['5m'];
+
+  return {
+    symbol,
+    available,
+    trend: mainTrend.trend,
+    strength: mainTrend.strength,
+    indicators: mainTrend,
+    levels,
+    timeframes,
+    candleCounts: Object.fromEntries(
+      Object.entries(candles).map(([key, value]) => [key, value.length])
+    ),
+    candles
+  };
 }
 
 async function getAnalysis() {
-  const results = await Promise.all(
-    SYMBOLS.map(analyzeSymbol)
-  );
+  const now = Date.now();
+  const cached = analysisCache.get('all');
 
-  const gold = results.find(item => item.symbol === "XAUUSD");
-  const silver = results.find(item => item.symbol === "XAGUSD");
-
-  const available = results.filter(item => item.available);
-
-  let overallTrend = "unknown";
-
-  if (available.length === 2) {
-    if (gold.trend === silver.trend) {
-      overallTrend = gold.trend;
-    } else {
-      overallTrend = "ranging";
-    }
-  } else if (available.length === 1) {
-    overallTrend = available[0].trend;
+  if (cached && now - cached.time < 30000) {
+    return cached.data;
   }
 
-  const strengths = available
-    .map(item => item.strength)
-    .filter(Number.isFinite);
+  const [gold, silver, marketData] = await Promise.all([
+    analyzeSymbol('XAUUSD'),
+    analyzeSymbol('XAGUSD'),
+    getMarketData()
+  ]);
 
-  const strength = strengths.length
-    ? Math.round(
-        strengths.reduce((sum, value) => sum + value, 0) /
-        strengths.length
-      )
-    : null;
+  const availableSymbols = [gold, silver].filter(item => item.available);
 
-  const primary = gold || {};
+  const trends = availableSymbols
+    .map(item => item.trend)
+    .filter(trend => trend !== 'غير متاح');
 
-  lastAnalysisUpdate = new Date().toISOString();
+  let overallTrend = 'غير متاح';
 
-  return {
-    available: available.length > 0,
-    engineReady: true,
-    provider: "biquote",
+  if (trends.length) {
+    const bullish = trends.filter(t => t === 'صاعد').length;
+    const bearish = trends.filter(t => t === 'هابط').length;
+
+    if (bullish > bearish) overallTrend = 'صاعد';
+    else if (bearish > bullish) overallTrend = 'هابط';
+    else overallTrend = 'متذبذب';
+  }
+
+  const data = {
+    available: availableSymbols.length > 0,
+    engineReady: availableSymbols.length > 0,
     overallTrend,
-    strength,
-    condition: overallTrend,
-    timeframes: primary.timeframes || {},
-    markets: results,
-    updatedAt: lastAnalysisUpdate
+    strength: availableSymbols.length
+      ? Math.round(average(availableSymbols.map(item => item.strength)))
+      : 0,
+    condition: overallTrend === 'متذبذب'
+      ? 'السوق متذبذب'
+      : overallTrend === 'غير متاح'
+        ? 'بيانات التحليل غير مكتملة'
+        : `الاتجاه العام ${overallTrend}`,
+    timeframes: gold.timeframes,
+    symbols: { XAUUSD: gold, XAGUSD: silver },
+    markets: marketData.markets,
+    timestamp: new Date().toISOString()
   };
+
+  analysisCache.set('all', { time: now, data });
+  return data;
 }
 
-// ---------- SIGNAL VALIDATION ----------
+function buildSignal(symbol, analysis, quote) {
+  if (!quote || !quote.tradable) return null;
+  if (!analysis || !analysis.available) return null;
 
-function getSignalKey(symbol) {
-  return `signal:${symbol}`;
-}
+  const bars = analysis.candles['5m'];
+  const bars15 = analysis.candles['15m'];
+  const bars1h = analysis.candles['1h'];
 
-function hasRecentSignal(symbol, side, barTime) {
-  const previous = lastSignalTime.get(getSignalKey(symbol));
-
-  if (!previous) return false;
-
-  return (
-    previous.side === side ||
-    barTime - previous.time < 15 * 60 * 1000
-  );
-}
-
-function buildSignal(symbol, bars, analysis) {
-  if (!bars || bars.length < 60) return null;
+  if (!bars || bars.length < 60 || !bars15 || bars15.length < 55) {
+    return null;
+  }
 
   const current = bars[bars.length - 1];
   const previous = bars[bars.length - 2];
 
-  const closes = bars.map(bar => bar.close);
+  const trend5 = analysis.timeframes['5m'];
+  const trend15 = analysis.timeframes['15m'];
+  const trend1h = analysis.timeframes['1h'];
 
-  const ema20 = ema(closes, 20);
-  const ema50 = ema(closes, 50);
-  const atr = calculateATR(bars, 14);
+  if (!trend5.available || !trend15.available) return null;
 
-  if (!ema20 || !ema50 || !atr || atr <= 0) {
-    return null;
-  }
+  const atr = trend5.atr;
+  if (!atr || atr <= 0) return null;
 
-  const body = Math.abs(current.close - current.open);
-  const lowerWick =
-    Math.min(current.open, current.close) - current.low;
+  const recent = bars.slice(-21, -1);
+  const support = Math.min(...recent.map(bar => bar.low));
+  const resistance = Math.max(...recent.map(bar => bar.high));
 
-  const upperWick =
-    current.high - Math.max(current.open, current.close);
+  const candleRange = current.high - current.low;
+  if (candleRange <= 0) return null;
+
+  const lowerWick = Math.min(current.open, current.close) - current.low;
+  const upperWick = current.high - Math.max(current.open, current.close);
+
+  const bullishCandle = current.close > current.open;
+  const bearishCandle = current.close < current.open;
+
+  const nearSupport = current.low <= support + atr * 0.30;
+  const nearResistance = current.high >= resistance - atr * 0.30;
 
   const bullishRejection =
-    current.close > current.open &&
-    lowerWick >= body * 0.5 &&
-    current.low <= ema20 + atr * 0.20 &&
-    current.close > ema20 &&
-    current.close > previous.high;
+    bullishCandle &&
+    lowerWick / candleRange >= 0.25 &&
+    current.close > previous.close &&
+    nearSupport;
 
   const bearishRejection =
-    current.close < current.open &&
-    upperWick >= body * 0.5 &&
-    current.high >= ema20 - atr * 0.20 &&
-    current.close < ema20 &&
-    current.close < previous.low;
+    bearishCandle &&
+    upperWick / candleRange >= 0.25 &&
+    current.close < previous.close &&
+    nearResistance;
 
-  const trend15 = analysis.timeframes["15m"];
-  const trend1h = analysis.timeframes["1h"];
+  const bullishTrend =
+    trend5.trend === 'صاعد' &&
+    trend15.trend === 'صاعد' &&
+    (!trend1h.available || trend1h.trend !== 'هابط');
+
+  const bearishTrend =
+    trend5.trend === 'هابط' &&
+    trend15.trend === 'هابط' &&
+    (!trend1h.available || trend1h.trend !== 'صاعد');
 
   let side = null;
 
-  if (
-    ema20 > ema50 &&
-    trend15 === "bullish" &&
-    trend1h === "bullish" &&
-    bullishRejection
-  ) {
-    side = "BUY";
-  }
-
-  if (
-    ema20 < ema50 &&
-    trend15 === "bearish" &&
-    trend1h === "bearish" &&
-    bearishRejection
-  ) {
-    side = "SELL";
-  }
+  if (bullishRejection && bullishTrend) side = 'BUY';
+  if (bearishRejection && bearishTrend) side = 'SELL';
 
   if (!side) return null;
 
   const entry = current.close;
+  const swingBars = bars.slice(-7, -1);
 
   let sl;
   let risk;
 
-  const recent = bars.slice(-6);
-
-  if (side === "BUY") {
-    const swingLow = Math.min(
-      ...recent.map(bar => bar.low)
-    );
-
-    sl = Math.min(
-      swingLow,
-      entry - atr * 1.2
-    );
-
+  if (side === 'BUY') {
+    const swingLow = Math.min(...swingBars.map(bar => bar.low));
+    sl = Math.min(swingLow, entry - atr * 1.2);
     risk = entry - sl;
   } else {
-    const swingHigh = Math.max(
-      ...recent.map(bar => bar.high)
-    );
-
-    sl = Math.max(
-      swingHigh,
-      entry + atr * 1.2
-    );
-
+    const swingHigh = Math.max(...swingBars.map(bar => bar.high));
+    sl = Math.max(swingHigh, entry + atr * 1.2);
     risk = sl - entry;
   }
 
-  if (!Number.isFinite(risk) || risk <= 0) {
-    return null;
-  }
+  if (!Number.isFinite(risk) || risk <= 0) return null;
 
-  const tp1 = side === "BUY"
-    ? entry + risk
-    : entry - risk;
+  const tp1 = side === 'BUY' ? entry + risk : entry - risk;
+  const tp2 = side === 'BUY' ? entry + risk * 2 : entry - risk * 2;
 
-  const tp2 = side === "BUY"
-    ? entry + risk * 2
-    : entry - risk * 2;
+  const decimals = symbol === 'XAUUSD' ? 2 : 3;
+  const round = value => Number(value.toFixed(decimals));
 
   return {
+    id: `${symbol}-${side}-${current.time}`,
     symbol,
     side,
-    entry,
-    tp1,
-    tp2,
-    sl,
-    timeframe: "5m",
-    candleTime: current.openTime,
-    risk,
-    method: "EMA + RSI + ATR + Multi-timeframe rejection"
+    type: side === 'BUY' ? 'شراء' : 'بيع',
+    entry: round(entry),
+    tp1: round(tp1),
+    tp2: round(tp2),
+    sl: round(sl),
+    timeframe: '5m',
+    trend: side === 'BUY' ? 'صاعد' : 'هابط',
+    reason: side === 'BUY'
+      ? 'ارتداد صاعد من منطقة دعم مع تأكيد الاتجاه'
+      : 'رفض سعري من منطقة مقاومة مع تأكيد الاتجاه',
+    candleTime: current.time,
+    createdAt: new Date().toISOString(),
+    status: 'جديدة',
+    telegramSent: false
   };
 }
 
-// ---------- TELEGRAM ----------
+function validateSignal(signal) {
+  if (!signal) return false;
 
-async function publishTelegram(message) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    return {
-      success: false,
-      message: "Telegram is not configured"
-    };
+  const values = [signal.entry, signal.tp1, signal.tp2, signal.sl];
+  if (!values.every(Number.isFinite)) return false;
+
+  if (signal.side === 'BUY') {
+    return signal.sl < signal.entry &&
+      signal.tp1 > signal.entry &&
+      signal.tp2 > signal.tp1;
   }
 
-  const url =
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  if (signal.side === 'SELL') {
+    return signal.sl > signal.entry &&
+      signal.tp1 < signal.entry &&
+      signal.tp2 < signal.tp1;
+  }
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      chat_id: TELEGRAM_CHAT_ID,
-      text: message
-    }),
-    signal: AbortSignal.timeout(10000)
-  });
-
-  const result = await response.json();
-
-  return {
-    success: response.ok && result.ok === true,
-    result
-  };
+  return false;
 }
 
-// ---------- SIGNAL STORAGE AND PUBLISHING ----------
+async function sendTelegram(signal) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    return { sent: false, reason: 'إعدادات Telegram غير مكتملة' };
+  }
 
-function formatSignalMessage(signal) {
-  return [
-    "SMC Trading Pro",
-    "",
-    signal.side === "BUY"
-      ? `🟢 إشارة شراء ${signal.symbol}`
-      : `🔴 إشارة بيع ${signal.symbol}`,
-    `الإطار الزمني: ${signal.timeframe}`,
-    `الدخول: ${signal.entry}`,
+  const direction = signal.side === 'BUY' ? 'شراء 🟢' : 'بيع 🔴';
+
+  const message = [
+    '📊 SMC Trading Pro',
+    '',
+    `السوق: ${signal.symbol}`,
+    `الإشارة: ${direction}`,
+    `سعر الدخول: ${signal.entry}`,
     `الهدف الأول TP1: ${signal.tp1}`,
     `الهدف الثاني TP2: ${signal.tp2}`,
     `وقف الخسارة SL: ${signal.sl}`,
-    "",
-    "التحليل: EMA + RSI + ATR",
-    "مصدر الأسعار: BiQuote",
-    `وقت الإشارة: ${signal.createdAt}`,
-    "",
-    "إدارة المخاطر مسؤولية المتداول."
-  ].join("\n");
+    `الإطار الزمني: ${signal.timeframe}`,
+    '',
+    `سبب الإشارة: ${signal.reason}`,
+    '',
+    '⚠️ تحليل فني وليس ضماناً للربح.'
+  ].join('\n');
+
+  try {
+    const response = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: TELEGRAM_CHAT_ID,
+          text: message
+        }),
+        signal: AbortSignal.timeout(12000)
+      }
+    );
+
+    const result = await response.json();
+
+    if (!response.ok || !result.ok) {
+      return {
+        sent: false,
+        reason: result.description || `Telegram HTTP ${response.status}`
+      };
+    }
+
+    return { sent: true };
+  } catch (error) {
+    return { sent: false, reason: error.message };
+  }
 }
 
 async function publishSignal(signal) {
-  if (!SYMBOLS.includes(signal.symbol)) {
+  if (!validateSignal(signal)) {
+    return { success: false, error: 'بيانات الإشارة غير صحيحة' };
+  }
+
+  const quote = await getQuote(signal.symbol);
+
+  if (!quote.tradable) {
     return {
       success: false,
-      message: "Unsupported market"
+      error: 'السوق مغلق أو بيانات السعر قديمة؛ لم يتم الإرسال'
     };
   }
 
-  const marketData = await getMarketData();
+  const previous = lastSignalBySymbol.get(signal.symbol);
 
-  const market = marketData.markets.find(
-    item => item.symbol === signal.symbol
-  );
+  if (previous) {
+    if (previous.side === signal.side) {
+      return { success: false, error: 'تم منع تكرار نفس اتجاه الإشارة' };
+    }
 
-  if (!market || !market.tradable) {
-    return {
-      success: false,
-      blocked: true,
-      message: !market
-        ? "Market data unavailable"
-        : !market.marketOpen
-          ? "Signal blocked: market is closed"
-          : !market.fresh
-            ? "Signal blocked: quote is stale"
-            : "Signal blocked: invalid market prices"
-    };
+    if (Date.now() - previous.time < SIGNAL_COOLDOWN_MS) {
+      return { success: false, error: 'فترة منع التكرار لم تنتهِ بعد' };
+    }
   }
 
-  const side = String(signal.side || "").toUpperCase();
+  const telegram = await sendTelegram(signal);
 
-  if (!["BUY", "SELL"].includes(side)) {
-    return {
-      success: false,
-      message: "Invalid signal side"
-    };
-  }
+  signal.telegramSent = telegram.sent;
+  signal.telegramError = telegram.sent ? null : telegram.reason;
 
-  const entry = Number(signal.entry);
-  const tp1 = Number(signal.tp1);
-  const tp2 = Number(signal.tp2);
-  const sl = Number(signal.sl);
+  signals.unshift(signal);
+  if (signals.length > 200) signals.length = 200;
 
-  if (![entry, tp1, tp2, sl].every(
-    value => Number.isFinite(value) && value > 0
-  )) {
-    return {
-      success: false,
-      message: "Invalid signal prices"
-    };
-  }
-
-  const validTargets = side === "BUY"
-    ? sl < entry && entry < tp1 && tp1 < tp2
-    : tp2 < tp1 && tp1 < entry && entry < sl;
-
-  if (!validTargets) {
-    return {
-      success: false,
-      message: "Invalid target or stop-loss order"
-    };
-  }
-
-  const record = {
-    id: `${Date.now()}-${signal.symbol}`,
-    symbol: signal.symbol,
-    side,
-    entry,
-    tp1,
-    tp2,
-    sl,
-    timeframe: signal.timeframe || "5m",
-    createdAt: new Date().toISOString(),
-    marketPrice: market.mid,
-    telegramSent: false
-  };
-
-  const telegram = await publishTelegram(
-    formatSignalMessage(record)
-  );
-
-  record.telegramSent = telegram.success;
-
-  signals.unshift(record);
-  signals = signals.slice(0, SIGNAL_HISTORY_LIMIT);
-
-  lastSignalTime.set(getSignalKey(signal.symbol), {
-    side,
+  lastSignalBySymbol.set(signal.symbol, {
+    side: signal.side,
     time: Date.now()
   });
 
   return {
     success: true,
-    signal: record,
+    signal,
     telegram
   };
 }
 
-// ---------- AUTOMATIC SIGNAL ENGINE ----------
-
 async function runSignalEngine() {
-  if (analysisRunning) return;
-
-  analysisRunning = true;
+  if (engineBusy) return;
+  engineBusy = true;
 
   try {
+    lastEngineRun = new Date().toISOString();
+
     const marketData = await getMarketData();
 
-    const analyses = await Promise.all(
-      SYMBOLS.map(analyzeSymbol)
-    );
-
     for (const symbol of SYMBOLS) {
-      const market = marketData.markets.find(
-        item => item.symbol === symbol
-      );
+      const quote = marketData.markets.find(item => item.symbol === symbol);
 
-      // لا إشارات عند إغلاق السوق أو قدم الأسعار.
-      if (!market || !market.tradable) continue;
+      if (!quote || !quote.tradable) continue;
 
-      const analysis = analyses.find(
-        item => item.symbol === symbol
-      );
+      const analysis = await analyzeSymbol(symbol);
+      if (!analysis.available) continue;
 
-      if (!analysis || !analysis.available) continue;
-
-      const bars = analysis.candles?.["5m"];
-
+      const bars = analysis.candles['5m'];
       if (!bars || bars.length < 60) continue;
 
-      const latest = bars[bars.length - 1];
-      const barKey = `${symbol}:5m`;
-      const previousTime = lastProcessedBar.get(barKey);
+      const latestBar = bars[bars.length - 1];
+      const previousBarTime = lastProcessedBar.get(symbol);
 
-      if (previousTime === latest.time) continue;
+      if (previousBarTime === latestBar.time) continue;
 
-      // لا نرسل إشارة على شمعة قديمة.
-      const candleCloseTime =
-        latest.time + INTERVAL_MS["5m"];
+      lastProcessedBar.set(symbol, latestBar.time);
 
-      if (
-        Date.now() - candleCloseTime >
-        10 * 60 * 1000
-      ) {
-        lastProcessedBar.set(barKey, latest.time);
-        continue;
-      }
-
-      lastProcessedBar.set(barKey, latest.time);
-
-      const signal = buildSignal(
-        symbol,
-        bars,
-        analysis
-      );
-
+      const signal = buildSignal(symbol, analysis, quote);
       if (!signal) continue;
-
-      if (
-        hasRecentSignal(
-          symbol,
-          signal.side,
-          latest.time
-        )
-      ) {
-        continue;
-      }
 
       await publishSignal(signal);
     }
-
   } catch (error) {
-    console.error("Signal engine:", error.message);
+    console.error('Signal engine error:', error.message);
   } finally {
-    analysisRunning = false;
+    engineBusy = false;
   }
 }
 
-// ---------- REQUEST BODY ----------
-
-function isAuthorized(req) {
-  return Boolean(
-    WEBHOOK_SECRET &&
-    req.headers["x-webhook-secret"] === WEBHOOK_SECRET
-  );
-}
-
-function readBody(req) {
+async function readBody(req) {
   return new Promise((resolve, reject) => {
-    let body = "";
-    let size = 0;
+    let body = '';
 
-    req.on("data", chunk => {
-      size += chunk.length;
-
-      if (size > 10000) {
-        reject(new Error("Request body too large"));
-        req.destroy();
-        return;
-      }
-
+    req.on('data', chunk => {
       body += chunk;
-    });
 
-    req.on("end", () => {
-      try {
-        resolve(JSON.parse(body || "{}"));
-      } catch {
-        reject(new Error("Invalid JSON"));
+      if (body.length > 100000) {
+        reject(new Error('حجم الطلب كبير'));
+        req.destroy();
       }
     });
 
-    req.on("error", reject);
+    req.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch {
+        reject(new Error('JSON غير صالح'));
+      }
+    });
+
+    req.on('error', reject);
   });
 }
 
-// ---------- API SERVER ----------
+function authorized(req) {
+  if (!WEBHOOK_SECRET) return false;
 
-const server = http.createServer(async (req, res) => {
-  if (req.method === "OPTIONS") {
-    return sendJSON(res, 200, {
-      success: true
+  const supplied =
+    req.headers['x-webhook-secret'] ||
+    req.headers.authorization?.replace(/^Bearer\s+/i, '');
+
+  return supplied === WEBHOOK_SECRET;
+}
+
+async function handleRequest(req, res) {
+  if (req.method === 'OPTIONS') {
+    return json(res, 204, {});
+  }
+
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const path = url.pathname;
+
+  if (req.method === 'GET' && path === '/') {
+    return json(res, 200, {
+      name: 'SMC Trading Pro',
+      status: 'running',
+      source: 'BiQuote',
+      markets: SYMBOLS,
+      version: '2.0'
     });
   }
 
-  const url = new URL(
-    req.url,
-    `http://${req.headers.host || "localhost"}`
-  );
+  if (req.method === 'GET' && path === '/api/status') {
+    const marketData = await getMarketData();
 
-  try {
-    if (req.method === "GET" && url.pathname === "/") {
-      return sendJSON(res, 200, {
-        name: "SMC Trading Pro",
-        status: "running",
-        version: "2.0.0",
-        provider: "BiQuote",
-        markets: SYMBOLS
-      });
+    return json(res, 200, {
+      online: true,
+      server: 'running',
+      provider: 'BiQuote',
+      providerConfigured: true,
+      telegramConfigured: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
+      marketOpen: marketData.markets.some(market => market.marketOpen),
+      allMarketsTradable: marketData.allMarketsTradable,
+      lastEngineRun,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  if (req.method === 'GET' && path === '/api/markets') {
+    return json(res, 200, await getMarketData());
+  }
+
+  if (req.method === 'GET' && path === '/api/analysis') {
+    return json(res, 200, await getAnalysis());
+  }
+
+  if (req.method === 'GET' && path === '/api/signals') {
+    const limit = Math.min(
+      100,
+      Math.max(1, Number(url.searchParams.get('limit') || 20))
+    );
+
+    return json(res, 200, {
+      signals: signals.slice(0, limit),
+      count: signals.length
+    });
+  }
+
+  if (req.method === 'POST' && path === '/api/signals/publish') {
+    if (!authorized(req)) {
+      return json(res, 401, { success: false, error: 'غير مصرح' });
     }
 
-    if (
-      req.method === "GET" &&
-      url.pathname === "/api/status"
-    ) {
-      return sendJSON(res, 200, getStatus());
-    }
-
-    if (
-      req.method === "GET" &&
-      url.pathname === "/api/markets"
-    ) {
-      return sendJSON(
-        res,
-        200,
-        await getMarketData()
-      );
-    }
-
-    if (
-      req.method === "GET" &&
-      url.pathname === "/api/analysis"
-    ) {
-      return sendJSON(
-        res,
-        200,
-        await getAnalysis()
-      );
-    }
-
-    if (
-      req.method === "GET" &&
-      url.pathname === "/api/signals"
-    ) {
-      const limit = Math.min(
-        100,
-        Math.max(
-          1,
-          Number(url.searchParams.get("limit") || 20)
-        )
-      );
-
-      return sendJSON(res, 200, {
-        signals: signals.slice(0, limit),
-        count: signals.length
-      });
-    }
-
-    if (
-      req.method === "POST" &&
-      url.pathname === "/api/signals/publish"
-    ) {
-      if (!isAuthorized(req)) {
-        return sendJSON(res, 401, {
-          success: false,
-          message: "Unauthorized"
-        });
-      }
-
+    try {
       const body = await readBody(req);
       const result = await publishSignal(body);
 
-      return sendJSON(
-        res,
-        result.success ? 200 : 409,
-        result
-      );
+      return json(res, result.success ? 200 : 400, result);
+    } catch (error) {
+      return json(res, 400, { success: false, error: error.message });
+    }
+  }
+
+  if (req.method === 'POST' && path === '/api/telegram/test') {
+    if (!authorized(req)) {
+      return json(res, 401, { success: false, error: 'غير مصرح' });
     }
 
-    if (
-      req.method === "POST" &&
-      url.pathname === "/api/telegram/test"
-    ) {
-      if (!isAuthorized(req)) {
-        return sendJSON(res, 401, {
-          success: false,
-          message: "Unauthorized"
-        });
-      }
+    const testMessage = {
+      symbol: 'SMC Trading Pro',
+      side: 'BUY',
+      entry: 0,
+      tp1: 0,
+      tp2: 0,
+      sl: 0,
+      timeframe: 'اختبار',
+      reason: 'رسالة اختبار اتصال Telegram'
+    };
 
-      const result = await publishTelegram(
-        "اختبار اتصال SMC Trading Pro\nهذه رسالة اختبار وليست إشارة تداول."
-      );
+    const result = await sendTelegram(testMessage);
 
-      return sendJSON(
-        res,
-        result.success ? 200 : 503,
-        result
-      );
-    }
-
-    return sendJSON(res, 404, {
-      success: false,
-      message: "Endpoint not found"
-    });
-
-  } catch (error) {
-    console.error("API error:", error);
-
-    return sendJSON(res, 500, {
-      success: false,
-      message: error.message || "Internal server error"
+    return json(res, result.sent ? 200 : 400, {
+      success: result.sent,
+      telegram: result
     });
   }
+
+  return json(res, 404, { error: 'المسار غير موجود' });
+}
+
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch(error => {
+    console.error('Request error:', error.message);
+
+    if (!res.headersSent) {
+      json(res, 500, {
+        success: false,
+        error: 'حدث خطأ داخلي في الخادم'
+      });
+    }
+  });
 });
 
-// ---------- START ----------
+server.listen(PORT, () => {
+  console.log(`SMC Trading Pro running on port ${PORT}`);
+  console.log('Market data source: BiQuote');
+  console.log('Supported markets: XAUUSD, XAGUSD');
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `SMC Trading Pro v2 running on port ${PORT}`
-  );
-
-  // بدء محرك التحليل بعد تشغيل الخادم.
   runSignalEngine();
-
-  setInterval(() => {
-    runSignalEngine();
-  }, POLL_INTERVAL_MS);
+  setInterval(runSignalEngine, POLL_INTERVAL_MS);
 });
