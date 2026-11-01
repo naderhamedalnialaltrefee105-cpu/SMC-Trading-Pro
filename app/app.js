@@ -1,3 +1,4 @@
+
 "use strict";
 
 /*
@@ -145,7 +146,6 @@ function updateMarketCard(symbol, data) {
     return;
   }
 
-  // نعرض السعر المتوسط بين Bid و Ask.
   setText(priceId, formatPrice(data.mid));
 
   const changePercent = Number(data.dayDiffPercent || 0);
@@ -207,7 +207,6 @@ async function loadMarkets() {
     updateMarketCard("XAUUSD", gold);
     updateMarketCard("XAGUSD", silver);
 
-    // نستخدم وقت آخر تحديث فعلي للسعر، وليس وقت جلب الخادم فقط.
     const quoteTimes = markets
       .map(item => item.lastQuoteAt || item.timestamp)
       .filter(Boolean);
@@ -292,9 +291,16 @@ async function loadAnalysis() {
     const timeframes = result.timeframes || {};
 
     for (const key of TIMEFRAMES) {
+      const frame = timeframes[key];
+
+      const frameTrend =
+        frame && frame.available
+          ? frame.trend
+          : "غير متاح";
+
       setText(
         `trend-${key}`,
-        translateTrend(timeframes[key])
+        translateTrend(frameTrend)
       );
     }
 
@@ -472,7 +478,10 @@ async function loadStatus() {
   try {
     const result = await apiGet(API.status);
 
-    const online = result.status === "running";
+    const online =
+      result.online === true ||
+      result.server === "running" ||
+      result.status === "running";
 
     setStatus(
       "server-status",
