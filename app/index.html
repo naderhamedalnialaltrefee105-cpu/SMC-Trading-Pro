@@ -1,0 +1,337 @@
+
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#080e19">
+  <meta name="description" content="SMC Trading Pro - منصة تحليل وإشارات التداول">
+  <meta name="application-name" content="SMC Trading Pro">
+
+  <title>SMC Trading Pro</title>
+
+  <link rel="manifest" href="/app/manifest.json">
+  <link rel="stylesheet" href="/app/style.css">
+  <link rel="icon" href="/app/icon.png">
+
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+</head>
+
+<body>
+
+  <div class="app-shell">
+
+    <!-- SIDEBAR -->
+    <aside class="sidebar" id="sidebar">
+
+      <div class="brand">
+        <div class="brand-icon">S</div>
+        <div>
+          <h2>SMC Trading</h2>
+          <span>PRO PLATFORM</span>
+        </div>
+      </div>
+
+      <nav class="main-nav">
+        <a href="#dashboard" class="nav-link active">
+          <span>▦</span> لوحة التحكم
+        </a>
+
+        <a href="#markets" class="nav-link">
+          <span>◈</span> الأسواق
+        </a>
+
+        <a href="#signals" class="nav-link">
+          <span>↗</span> إشارات التداول
+        </a>
+
+        <a href="#analysis" class="nav-link">
+          <span>◉</span> تحليل السوق
+        </a>
+
+        <a href="#history" class="nav-link">
+          <span>▤</span> سجل الإشارات
+        </a>
+
+        <a href="#settings" class="nav-link">
+          <span>⚙</span> الإعدادات
+        </a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <span class="connection-indicator" id="sidebar-status"></span>
+        <span id="sidebar-status-text">جاري الاتصال</span>
+      </div>
+
+    </aside>
+
+    <!-- MAIN CONTENT -->
+    <main class="main-content">
+
+      <!-- TOP BAR -->
+      <header class="topbar">
+
+        <button class="menu-button" id="menu-toggle" aria-label="القائمة">
+          ☰
+        </button>
+
+        <div class="page-heading">
+          <h1>لوحة التداول</h1>
+          <p>مرحباً بك في SMC Trading Pro</p>
+        </div>
+
+        <div class="topbar-actions">
+          <span class="system-status" id="system-status">
+            <span class="status-dot"></span>
+            جاري الاتصال
+          </span>
+
+          <button class="icon-button" id="refresh-button" title="تحديث البيانات">
+            ↻
+          </button>
+        </div>
+
+      </header>
+
+      <!-- DASHBOARD -->
+      <section id="dashboard" class="dashboard-section">
+
+        <div class="section-heading">
+          <div>
+            <h2>نظرة عامة</h2>
+            <p>متابعة الأسواق وإشارات التداول</p>
+          </div>
+
+          <span class="date-display" id="current-date">--</span>
+        </div>
+
+        <!-- MARKET CARDS -->
+        <div class="market-grid" id="markets">
+
+          <article class="market-card">
+            <div class="market-card-header">
+              <span>الذهب</span>
+              <span class="market-symbol">XAUUSD</span>
+            </div>
+
+            <div class="market-price" id="gold-price">--</div>
+            <div class="market-change" id="gold-change">بانتظار البيانات</div>
+            <div class="market-footer">سعر الذهب مقابل الدولار</div>
+          </article>
+
+          <article class="market-card">
+            <div class="market-card-header">
+              <span>الفضة</span>
+              <span class="market-symbol">XAGUSD</span>
+            </div>
+
+            <div class="market-price" id="silver-price">--</div>
+            <div class="market-change" id="silver-change">بانتظار البيانات</div>
+            <div class="market-footer">سعر الفضة مقابل الدولار</div>
+          </article>
+
+        </div>
+
+        <!-- TREND PANEL -->
+        <section class="panel" id="analysis">
+
+          <div class="panel-header">
+            <div>
+              <h2>تحليل الاتجاه</h2>
+              <p>حالة السوق حسب الإطار الزمني</p>
+            </div>
+
+            <span class="live-label">تحليل النظام</span>
+          </div>
+
+          <div class="trend-summary">
+            <div class="trend-box">
+              <span>الاتجاه العام</span>
+              <strong id="overall-trend">غير محدد</strong>
+            </div>
+
+            <div class="trend-box">
+              <span>قوة الاتجاه</span>
+              <strong id="trend-strength">--</strong>
+            </div>
+
+            <div class="trend-box">
+              <span>حالة السوق</span>
+              <strong id="market-condition">بانتظار البيانات</strong>
+            </div>
+          </div>
+
+          <div class="timeframe-grid">
+
+            <div class="timeframe-item">
+              <span>1 دقيقة</span>
+              <strong id="trend-1m">--</strong>
+            </div>
+
+            <div class="timeframe-item">
+              <span>3 دقائق</span>
+              <strong id="trend-3m">--</strong>
+            </div>
+
+            <div class="timeframe-item">
+              <span>5 دقائق</span>
+              <strong id="trend-5m">--</strong>
+            </div>
+
+            <div class="timeframe-item">
+              <span>15 دقيقة</span>
+              <strong id="trend-15m">--</strong>
+            </div>
+
+            <div class="timeframe-item">
+              <span>30 دقيقة</span>
+              <strong id="trend-30m">--</strong>
+            </div>
+
+            <div class="timeframe-item">
+              <span>ساعة</span>
+              <strong id="trend-1h">--</strong>
+            </div>
+
+            <div class="timeframe-item">
+              <span>4 ساعات</span>
+              <strong id="trend-4h">--</strong>
+            </div>
+
+            <div class="timeframe-item">
+              <span>يومي</span>
+              <strong id="trend-1d">--</strong>
+            </div>
+
+          </div>
+
+        </section>
+
+        <!-- SIGNALS -->
+        <section class="panel" id="signals">
+
+          <div class="panel-header">
+            <div>
+              <h2>آخر إشارات التداول</h2>
+              <p>الإشارات المستلمة من TradingView</p>
+            </div>
+
+            <span class="signal-counter" id="signal-count">0 إشارة</span>
+          </div>
+
+          <div class="signal-list" id="signal-list">
+
+            <div class="empty-state" id="signals-empty">
+              <div class="empty-icon">◈</div>
+              <h3>لا توجد إشارات حتى الآن</h3>
+              <p>ستظهر هنا إشارات الشراء والبيع عند استقبالها من TradingView.</p>
+            </div>
+
+          </div>
+
+        </section>
+
+        <!-- SIGNAL HISTORY -->
+        <section class="panel" id="history">
+
+          <div class="panel-header">
+            <div>
+              <h2>سجل التداول</h2>
+              <p>تاريخ الإشارات المستلمة</p>
+            </div>
+          </div>
+
+          <div class="table-wrapper">
+            <table class="signals-table">
+              <thead>
+                <tr>
+                  <th>الوقت</th>
+                  <th>السوق</th>
+                  <th>النوع</th>
+                  <th>الدخول</th>
+                  <th>TP1</th>
+                  <th>TP2</th>
+                  <th>وقف الخسارة</th>
+                </tr>
+              </thead>
+
+              <tbody id="history-table-body">
+                <tr>
+                  <td colspan="7" class="table-empty">
+                    لا توجد بيانات مسجلة
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+        </section>
+
+        <!-- SETTINGS -->
+        <section class="panel" id="settings">
+
+          <div class="panel-header">
+            <div>
+              <h2>إعدادات النظام</h2>
+              <p>حالة الخدمات والاتصالات</p>
+            </div>
+          </div>
+
+          <div class="settings-list">
+
+            <div class="setting-row">
+              <span>خادم التطبيق</span>
+              <strong id="server-status">غير متصل</strong>
+            </div>
+
+            <div class="setting-row">
+              <span>TradingView Webhook</span>
+              <strong id="webhook-status">بانتظار الإشارات</strong>
+            </div>
+
+            <div class="setting-row">
+              <span>Telegram Bot</span>
+              <strong id="telegram-status">غير مفحوص</strong>
+            </div>
+
+            <div class="setting-row">
+              <span>آخر تحديث</span>
+              <strong id="last-update">--</strong>
+            </div>
+
+          </div>
+
+        </section>
+
+      </section>
+
+      <!-- FOOTER -->
+      <footer class="app-footer">
+        <p>SMC Trading Pro v1</p>
+        <span>TradingView + Telegram</span>
+        <small>منصة تحليل وإدارة إشارات التداول. التداول ينطوي على مخاطر.</small>
+      </footer>
+
+    </main>
+
+  </div>
+
+  <!-- NOTIFICATIONS -->
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <!-- APPLICATION SCRIPT -->
+  <script src="/app/app.js" defer></script>
+
+  <script>
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("/app/sw.js")
+          .catch(error => console.error("Service Worker:", error));
+      });
+    }
+  </script>
+
+</body>
+</html>
