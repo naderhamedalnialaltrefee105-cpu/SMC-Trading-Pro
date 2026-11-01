@@ -1,0 +1,14 @@
+
+{
+  "name": "smc-trading-pro",
+  "version": "1.0.0",
+  "description": "SMC Trading Pro - Gold and Silver Analysis and Telegram Signals",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {}
+}
