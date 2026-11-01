@@ -1,11 +1,11 @@
-
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
   <meta name="theme-color" content="#080e19">
-  <meta name="description" content="SMC Trading Pro - منصة تحليل وإشارات التداول">
+  <meta name="description" content="SMC Trading Pro - منصة تحليل الذهب والفضة وإشارات التداول">
   <meta name="application-name" content="SMC Trading Pro">
 
   <title>SMC Trading Pro</title>
@@ -101,7 +101,7 @@
         <div class="section-heading">
           <div>
             <h2>نظرة عامة</h2>
-            <p>متابعة الأسواق وإشارات التداول</p>
+            <p>متابعة الذهب والفضة وإشارات التداول</p>
           </div>
 
           <span class="date-display" id="current-date">--</span>
@@ -134,6 +134,44 @@
 
         </div>
 
+        <!-- MARKET SOURCE -->
+        <section class="panel">
+
+          <div class="panel-header">
+            <div>
+              <h2>حالة بيانات السوق</h2>
+              <p>مصدر الأسعار: BiQuote</p>
+            </div>
+
+            <span class="live-label">تحديث تلقائي</span>
+          </div>
+
+          <div class="settings-list">
+
+            <div class="setting-row">
+              <span>حالة الذهب</span>
+              <strong id="gold-market-status">بانتظار البيانات</strong>
+            </div>
+
+            <div class="setting-row">
+              <span>حالة الفضة</span>
+              <strong id="silver-market-status">بانتظار البيانات</strong>
+            </div>
+
+            <div class="setting-row">
+              <span>آخر تحديث للأسعار</span>
+              <strong id="last-update">--</strong>
+            </div>
+
+            <div class="setting-row">
+              <span>حالة إصدار الإشارات</span>
+              <strong id="signal-market-status">بانتظار التحقق</strong>
+            </div>
+
+          </div>
+
+        </section>
+
         <!-- TREND PANEL -->
         <section class="panel" id="analysis">
 
@@ -143,10 +181,11 @@
               <p>حالة السوق حسب الإطار الزمني</p>
             </div>
 
-            <span class="live-label">تحليل النظام</span>
+            <span class="live-label">محرك التحليل</span>
           </div>
 
           <div class="trend-summary">
+
             <div class="trend-box">
               <span>الاتجاه العام</span>
               <strong id="overall-trend">غير محدد</strong>
@@ -161,6 +200,7 @@
               <span>حالة السوق</span>
               <strong id="market-condition">بانتظار البيانات</strong>
             </div>
+
           </div>
 
           <div class="timeframe-grid">
@@ -215,7 +255,7 @@
           <div class="panel-header">
             <div>
               <h2>آخر إشارات التداول</h2>
-              <p>الإشارات المستلمة من TradingView</p>
+              <p>إشارات محرك التحليل في الخادم</p>
             </div>
 
             <span class="signal-counter" id="signal-count">0 إشارة</span>
@@ -226,7 +266,7 @@
             <div class="empty-state" id="signals-empty">
               <div class="empty-icon">◈</div>
               <h3>لا توجد إشارات حتى الآن</h3>
-              <p>ستظهر هنا إشارات الشراء والبيع عند استقبالها من TradingView.</p>
+              <p>ستظهر هنا إشارات الشراء والبيع بعد تشغيل محرك التحليل.</p>
             </div>
 
           </div>
@@ -239,12 +279,14 @@
           <div class="panel-header">
             <div>
               <h2>سجل التداول</h2>
-              <p>تاريخ الإشارات المستلمة</p>
+              <p>تاريخ إشارات الذهب والفضة</p>
             </div>
           </div>
 
           <div class="table-wrapper">
+
             <table class="signals-table">
+
               <thead>
                 <tr>
                   <th>الوقت</th>
@@ -258,13 +300,17 @@
               </thead>
 
               <tbody id="history-table-body">
+
                 <tr>
                   <td colspan="7" class="table-empty">
                     لا توجد بيانات مسجلة
                   </td>
                 </tr>
+
               </tbody>
+
             </table>
+
           </div>
 
         </section>
@@ -287,8 +333,8 @@
             </div>
 
             <div class="setting-row">
-              <span>TradingView Webhook</span>
-              <strong id="webhook-status">بانتظار الإشارات</strong>
+              <span>مصدر الأسعار BiQuote</span>
+              <strong id="webhook-status">بانتظار البيانات</strong>
             </div>
 
             <div class="setting-row">
@@ -310,8 +356,11 @@
       <!-- FOOTER -->
       <footer class="app-footer">
         <p>SMC Trading Pro v1</p>
-        <span>TradingView + Telegram</span>
-        <small>منصة تحليل وإدارة إشارات التداول. التداول ينطوي على مخاطر.</small>
+        <span>BiQuote + SMC Analysis + Telegram</span>
+        <small>
+          منصة تحليل وإدارة إشارات التداول.
+          التداول ينطوي على مخاطر مالية.
+        </small>
       </footer>
 
     </main>
@@ -319,7 +368,11 @@
   </div>
 
   <!-- NOTIFICATIONS -->
-  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+  <div
+    id="toast-container"
+    class="toast-container"
+    aria-live="polite">
+  </div>
 
   <!-- APPLICATION SCRIPT -->
   <script src="/app/app.js" defer></script>
@@ -328,7 +381,9 @@
     if ("serviceWorker" in navigator) {
       window.addEventListener("load", () => {
         navigator.serviceWorker.register("/app/sw.js")
-          .catch(error => console.error("Service Worker:", error));
+          .catch(error => {
+            console.error("Service Worker:", error);
+          });
       });
     }
   </script>
