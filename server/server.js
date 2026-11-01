@@ -1,13 +1,16 @@
-
 'use strict';
 
 const http = require('http');
+const fs = require('fs');
+const pathModule = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 const BIQUOTE_API_URL = (process.env.BIQUOTE_API_URL || 'https://biquote.io/api').replace(/\/+$/, '');
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+
+const APP_DIR = pathModule.resolve(__dirname, '..', 'app');
 
 const SYMBOLS = ['XAUUSD', 'XAGUSD'];
 const INTERVALS = ['1m', '5m', '15m', '30m', '1h', '4h', '1d'];
@@ -755,6 +758,78 @@ function authorized(req) {
   return supplied === WEBHOOK_SECRET;
 }
 
+/*
+ * تقديم ملفات واجهة التطبيق من مجلد app
+ * المسار / يفتح index.html
+ * والمسارات /app/... تقدم ملفات الواجهة وPWA
+ */
+async function serveAppFile(path, res) {
+  const requestedFile = path === '/'
+    ? 'index.html'
+    : path.slice('/app/'.length);
+
+  let decodedFile;
+
+  try {
+    decodedFile = decodeURIComponent(requestedFile);
+  } catch {
+    return json(res, 400, {
+      success: false,
+      error: 'مسار الملف غير صالح'
+    });
+  }
+
+  const filePath = pathModule.resolve(APP_DIR, decodedFile);
+  const relativePath = pathModule.relative(APP_DIR, filePath);
+
+  if (
+    relativePath.startsWith('..') ||
+    pathModule.isAbsolute(relativePath)
+  ) {
+    return json(res, 403, {
+      success: false,
+      error: 'غير مسموح'
+    });
+  }
+
+  try {
+    const file = await fs.promises.readFile(filePath);
+    const extension = pathModule.extname(filePath).toLowerCase();
+
+    const contentTypes = {
+      '.html': 'text/html; charset=utf-8',
+      '.css': 'text/css; charset=utf-8',
+      '.js': 'application/javascript; charset=utf-8',
+      '.json': 'application/manifest+json; charset=utf-8',
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.svg': 'image/svg+xml',
+      '.ico': 'image/x-icon',
+      '.webp': 'image/webp'
+    };
+
+    res.writeHead(200, {
+      'Content-Type': contentTypes[extension] || 'application/octet-stream',
+      'Cache-Control': extension === '.html'
+        ? 'no-cache'
+        : 'public, max-age=3600',
+      'Access-Control-Allow-Origin': '*'
+    });
+
+    return res.end(file);
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+      return json(res, 404, {
+        success: false,
+        error: 'ملف التطبيق غير موجود'
+      });
+    }
+
+    throw error;
+  }
+}
+
 async function handleRequest(req, res) {
   if (req.method === 'OPTIONS') {
     return json(res, 204, {});
@@ -763,14 +838,12 @@ async function handleRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const path = url.pathname;
 
-  if (req.method === 'GET' && path === '/') {
-    return json(res, 200, {
-      name: 'SMC Trading Pro',
-      status: 'running',
-      source: 'BiQuote',
-      markets: SYMBOLS,
-      version: '2.0'
-    });
+  // الصفحة الرئيسية وملفات الواجهة
+  if (
+    req.method === 'GET' &&
+    (path === '/' || path.startsWith('/app/'))
+  ) {
+    return serveAppFile(path, res);
   }
 
   if (req.method === 'GET' && path === '/api/status') {
@@ -811,7 +884,10 @@ async function handleRequest(req, res) {
 
   if (req.method === 'POST' && path === '/api/signals/publish') {
     if (!authorized(req)) {
-      return json(res, 401, { success: false, error: 'غير مصرح' });
+      return json(res, 401, {
+        success: false,
+        error: 'غير مصرح'
+      });
     }
 
     try {
@@ -820,13 +896,19 @@ async function handleRequest(req, res) {
 
       return json(res, result.success ? 200 : 400, result);
     } catch (error) {
-      return json(res, 400, { success: false, error: error.message });
+      return json(res, 400, {
+        success: false,
+        error: error.message
+      });
     }
   }
 
   if (req.method === 'POST' && path === '/api/telegram/test') {
     if (!authorized(req)) {
-      return json(res, 401, { success: false, error: 'غير مصرح' });
+      return json(res, 401, {
+        success: false,
+        error: 'غير مصرح'
+      });
     }
 
     const testMessage = {
@@ -848,7 +930,9 @@ async function handleRequest(req, res) {
     });
   }
 
-  return json(res, 404, { error: 'المسار غير موجود' });
+  return json(res, 404, {
+    error: 'المسار غير موجود'
+  });
 }
 
 const server = http.createServer((req, res) => {
@@ -860,6 +944,8 @@ const server = http.createServer((req, res) => {
         success: false,
         error: 'حدث خطأ داخلي في الخادم'
       });
+    } else if (!res.writableEnded) {
+      res.end();
     }
   });
 });
@@ -868,6 +954,7 @@ server.listen(PORT, () => {
   console.log(`SMC Trading Pro running on port ${PORT}`);
   console.log('Market data source: BiQuote');
   console.log('Supported markets: XAUUSD, XAGUSD');
+  console.log(`App directory: ${APP_DIR}`);
 
   runSignalEngine();
   setInterval(runSignalEngine, POLL_INTERVAL_MS);
