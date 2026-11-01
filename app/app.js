@@ -1,10 +1,9 @@
-
 "use strict";
 
 /*
  * SMC Trading Pro
  * Frontend application
- * Market data provider: BiQuote (through our server)
+ * Market data provider: BiQuote
  */
 
 const API = {
@@ -17,7 +16,8 @@ const API = {
 const state = {
   loading: false,
   lastUpdate: null,
-  signals: []
+  signals: [],
+  markets: []
 };
 
 const TIMEFRAMES = [
@@ -25,14 +25,16 @@ const TIMEFRAMES = [
   "30m", "1h", "4h", "1d"
 ];
 
-const $ = (id) => document.getElementById(id);
+const $ = id => document.getElementById(id);
 
 // ---------- HELPERS ----------
 
 function formatPrice(value) {
   const number = Number(value);
 
-  if (!Number.isFinite(number)) return "--";
+  if (!Number.isFinite(number) || number <= 0) {
+    return "--";
+  }
 
   return number.toLocaleString("en-US", {
     minimumFractionDigits: 2,
@@ -45,22 +47,27 @@ function formatTime(value) {
 
   const date = new Date(value);
 
-  if (Number.isNaN(date.getTime())) return "--";
+  if (Number.isNaN(date.getTime())) {
+    return "--";
+  }
 
-  return date.toLocaleTimeString("ar-SA", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit"
+  return date.toLocaleString("ar-SA", {
+    dateStyle: "short",
+    timeStyle: "medium"
   });
 }
 
 function setText(id, value) {
   const element = $(id);
-  if (element) element.textContent = value ?? "--";
+
+  if (element) {
+    element.textContent = value ?? "--";
+  }
 }
 
 function setStatus(id, text, connected) {
   const element = $(id);
+
   if (!element) return;
 
   element.textContent = text;
@@ -71,7 +78,9 @@ function setStatus(id, text, connected) {
 async function apiGet(url) {
   const response = await fetch(url, {
     method: "GET",
-    headers: { "Accept": "application/json" },
+    headers: {
+      Accept: "application/json"
+    },
     cache: "no-store"
   });
 
@@ -86,9 +95,11 @@ async function apiGet(url) {
 
 function showToast(message, type = "info") {
   const container = $("toast-container");
+
   if (!container) return;
 
   const toast = document.createElement("div");
+
   toast.className = `toast toast-${type}`;
   toast.textContent = message;
 
@@ -101,14 +112,18 @@ function showToast(message, type = "info") {
 
 function updateDate() {
   const element = $("current-date");
+
   if (!element) return;
 
-  element.textContent = new Date().toLocaleDateString("ar-SA", {
-    weekday: "long",
-    year: "numeric",
-    month: "long",
-    day: "numeric"
-  });
+  element.textContent = new Date().toLocaleDateString(
+    "ar-SA",
+    {
+      weekday: "long",
+      year: "numeric",
+      month: "long",
+      day: "numeric"
+    }
+  );
 }
 
 // ---------- MARKET PRICES ----------
@@ -116,46 +131,111 @@ function updateDate() {
 function updateMarketCard(symbol, data) {
   const isGold = symbol === "XAUUSD";
 
-  const priceId = isGold ? "gold-price" : "silver-price";
-  const changeId = isGold ? "gold-change" : "silver-change";
+  const priceId = isGold
+    ? "gold-price"
+    : "silver-price";
 
-  if (!data || data.price === undefined) {
+  const changeId = isGold
+    ? "gold-change"
+    : "silver-change";
+
+  if (!data || !data.validPrices) {
     setText(priceId, "--");
-    setText(changeId, "بانتظار البيانات");
+    setText(changeId, "السعر غير متاح");
     return;
   }
 
-  setText(priceId, formatPrice(data.price));
+  // نعرض السعر المتوسط بين Bid و Ask.
+  setText(priceId, formatPrice(data.mid));
 
-  const change = Number(data.change ?? 0);
-  const percent = Number(data.changePercent ?? 0);
+  const changePercent = Number(data.dayDiffPercent || 0);
+  const direction = String(data.direction || "").toUpperCase();
+
   const element = $(changeId);
 
-  if (element) {
-    const sign = change > 0 ? "+" : "";
+  if (!element) return;
 
-    element.textContent =
-      `${sign}${formatPrice(change)} (${sign}${percent.toFixed(2)}%)`;
+  element.classList.remove("positive", "negative");
 
-    element.classList.toggle("positive", change > 0);
-    element.classList.toggle("negative", change < 0);
+  if (changePercent > 0) {
+    element.classList.add("positive");
+  } else if (changePercent < 0) {
+    element.classList.add("negative");
   }
+
+  const sign = changePercent > 0 ? "+" : "";
+
+  let statusText = "";
+
+  if (data.marketOpen && data.fresh) {
+    statusText = "السوق مفتوح";
+  } else if (!data.marketOpen) {
+    statusText = "السوق مغلق — آخر سعر إغلاق";
+  } else if (!data.fresh) {
+    statusText = "السعر قديم — الإشارات متوقفة";
+  }
+
+  const trendText =
+    direction === "UP"
+      ? "صاعد"
+      : direction === "DOWN"
+        ? "هابط"
+        : "غير محدد";
+
+  element.textContent =
+    `${statusText} | ${trendText} | ${sign}${changePercent.toFixed(2)}%`;
 }
 
 async function loadMarkets() {
   try {
     const result = await apiGet(API.markets);
 
-    updateMarketCard("XAUUSD", result.XAUUSD);
-    updateMarketCard("XAGUSD", result.XAGUSD);
+    const markets = Array.isArray(result.markets)
+      ? result.markets
+      : [];
 
-    state.lastUpdate = result.updatedAt || new Date().toISOString();
-    setText("last-update", formatTime(state.lastUpdate));
+    state.markets = markets;
+
+    const gold = markets.find(
+      item => item.symbol === "XAUUSD"
+    );
+
+    const silver = markets.find(
+      item => item.symbol === "XAGUSD"
+    );
+
+    updateMarketCard("XAUUSD", gold);
+    updateMarketCard("XAGUSD", silver);
+
+    // نستخدم وقت آخر تحديث فعلي للسعر، وليس وقت جلب الخادم فقط.
+    const quoteTimes = markets
+      .map(item => item.lastQuoteAt || item.timestamp)
+      .filter(Boolean);
+
+    state.lastUpdate = quoteTimes[0] || null;
+
+    setText(
+      "last-update",
+      formatTime(state.lastUpdate)
+    );
+
+    const allOpenAndFresh =
+      markets.length === 2 &&
+      markets.every(item => item.tradable === true);
+
+    setText(
+      "system-status",
+      allOpenAndFresh
+        ? "السوق مفتوح والبيانات محدثة"
+        : "الإشارات متوقفة أو البيانات غير مكتملة"
+    );
 
   } catch (error) {
     console.error("Market data:", error);
-    setText("gold-change", "تعذر جلب السعر");
-    setText("silver-change", "تعذر جلب السعر");
+
+    setText("gold-change", "تعذر جلب بيانات الذهب");
+    setText("silver-change", "تعذر جلب بيانات الفضة");
+    setText("last-update", "--");
   }
 }
 
@@ -180,19 +260,42 @@ async function loadAnalysis() {
   try {
     const result = await apiGet(API.analysis);
 
-    setText("overall-trend", translateTrend(result.overallTrend));
+    if (!result.available) {
+      setText("overall-trend", "بانتظار محرك التحليل");
+      setText("trend-strength", "--");
+      setText("market-condition", "غير محدد");
+
+      for (const key of TIMEFRAMES) {
+        setText(`trend-${key}`, "غير متاح");
+      }
+
+      return;
+    }
+
+    setText(
+      "overall-trend",
+      translateTrend(result.overallTrend)
+    );
 
     setText(
       "trend-strength",
-      result.strength !== undefined ? `${result.strength}%` : "--"
+      result.strength !== undefined
+        ? `${result.strength}%`
+        : "--"
     );
 
-    setText("market-condition", translateTrend(result.condition));
+    setText(
+      "market-condition",
+      translateTrend(result.condition)
+    );
 
     const timeframes = result.timeframes || {};
 
     for (const key of TIMEFRAMES) {
-      setText(`trend-${key}`, translateTrend(timeframes[key]));
+      setText(
+        `trend-${key}`,
+        translateTrend(timeframes[key])
+      );
     }
 
   } catch (error) {
@@ -204,21 +307,31 @@ async function loadAnalysis() {
 
 function createCell(value) {
   const cell = document.createElement("td");
+
   cell.textContent = value ?? "--";
+
   return cell;
 }
 
 function signalSide(signal) {
-  const side = String(signal.side || signal.type || "").toLowerCase();
+  const side = String(
+    signal.side || signal.type || ""
+  ).toLowerCase();
 
-  if (side === "buy" || side === "شراء") return "شراء";
-  if (side === "sell" || side === "بيع") return "بيع";
+  if (side === "buy" || side === "شراء") {
+    return "شراء";
+  }
+
+  if (side === "sell" || side === "بيع") {
+    return "بيع";
+  }
 
   return signal.side || signal.type || "--";
 }
 
 function renderSignalCard(signal) {
   const card = document.createElement("article");
+
   card.className = "signal-card";
 
   const side = signalSide(signal);
@@ -228,15 +341,24 @@ function renderSignalCard(signal) {
   heading.className = "signal-card-header";
 
   const title = document.createElement("strong");
-  title.textContent = `${signal.symbol || "--"} | ${side}`;
-  title.className = isBuy ? "buy-text" : "sell-text";
+
+  title.textContent =
+    `${signal.symbol || "--"} | ${side}`;
+
+  title.className = isBuy
+    ? "buy-text"
+    : "sell-text";
 
   const time = document.createElement("span");
-  time.textContent = formatTime(signal.time || signal.createdAt);
+
+  time.textContent = formatTime(
+    signal.time || signal.createdAt
+  );
 
   heading.append(title, time);
 
   const details = document.createElement("div");
+
   details.className = "signal-details";
 
   const values = [
@@ -260,6 +382,7 @@ function renderSignalCard(signal) {
   }
 
   card.append(heading, details);
+
   return card;
 }
 
@@ -270,32 +393,45 @@ function renderSignals(signals) {
 
   if (!container || !history) return;
 
-  container.querySelectorAll(".signal-card").forEach(item => item.remove());
+  container
+    .querySelectorAll(".signal-card")
+    .forEach(item => item.remove());
+
   history.replaceChildren();
 
   if (!Array.isArray(signals) || signals.length === 0) {
-    if (empty) empty.hidden = false;
+    if (empty) {
+      empty.hidden = false;
+    }
 
     const row = document.createElement("tr");
     const cell = document.createElement("td");
 
     cell.colSpan = 7;
     cell.className = "table-empty";
-    cell.textContent = "لا توجد بيانات مسجلة";
+    cell.textContent = "لا توجد إشارات مسجلة";
 
     row.appendChild(cell);
     history.appendChild(row);
 
     setText("signal-count", "0 إشارة");
+
     return;
   }
 
-  if (empty) empty.hidden = true;
+  if (empty) {
+    empty.hidden = true;
+  }
 
-  setText("signal-count", `${signals.length} إشارة`);
+  setText(
+    "signal-count",
+    `${signals.length} إشارة`
+  );
 
   signals.forEach(signal => {
-    container.appendChild(renderSignalCard(signal));
+    container.appendChild(
+      renderSignalCard(signal)
+    );
 
     const row = document.createElement("tr");
 
@@ -322,6 +458,7 @@ async function loadSignals() {
       : result.signals || [];
 
     state.signals = signals;
+
     renderSignals(signals);
 
   } catch (error) {
@@ -335,7 +472,7 @@ async function loadStatus() {
   try {
     const result = await apiGet(API.status);
 
-    const online = result.ok === true || result.status === "online";
+    const online = result.status === "running";
 
     setStatus(
       "server-status",
@@ -351,30 +488,44 @@ async function loadStatus() {
 
     setStatus(
       "system-status",
-      online ? "النظام متصل" : "النظام غير متصل",
+      online ? "الخادم يعمل" : "الخادم متوقف",
       online
     );
 
-    const provider = String(result.provider || "").toLowerCase();
-
     setText(
       "webhook-status",
-      provider === "biquote"
-        ? "BiQuote متصل"
-        : "بانتظار بيانات BiQuote"
+      result.providerConfigured
+        ? "BiQuote مهيأ"
+        : "BiQuote غير مهيأ"
     );
 
     setText(
       "telegram-status",
-      result.telegram === true ? "متصل" : "غير مفحوص"
+      result.telegramConfigured
+        ? "Telegram مهيأ"
+        : "Telegram غير مهيأ"
     );
 
   } catch (error) {
     console.error("Server status:", error);
 
-    setStatus("server-status", "غير متصل", false);
-    setStatus("sidebar-status-text", "الخادم غير متصل", false);
-    setStatus("system-status", "الخادم غير متصل", false);
+    setStatus(
+      "server-status",
+      "غير متصل",
+      false
+    );
+
+    setStatus(
+      "sidebar-status-text",
+      "الخادم غير متصل",
+      false
+    );
+
+    setStatus(
+      "system-status",
+      "الخادم غير متصل",
+      false
+    );
 
     setText("webhook-status", "بانتظار الخادم");
     setText("telegram-status", "غير مفحوص");
@@ -402,6 +553,7 @@ async function refreshDashboard() {
       loadAnalysis(),
       loadSignals()
     ]);
+
   } finally {
     state.loading = false;
 
@@ -424,25 +576,31 @@ function setupMenu() {
     sidebar.classList.toggle("open");
   });
 
-  document.querySelectorAll(".nav-link").forEach(link => {
-    link.addEventListener("click", () => {
-      sidebar.classList.remove("open");
+  document
+    .querySelectorAll(".nav-link")
+    .forEach(link => {
+      link.addEventListener("click", () => {
+        sidebar.classList.remove("open");
+      });
     });
-  });
 }
 
 // ---------- NAVIGATION ----------
 
 function setupNavigation() {
-  document.querySelectorAll(".nav-link").forEach(link => {
-    link.addEventListener("click", () => {
-      document.querySelectorAll(".nav-link").forEach(item => {
-        item.classList.remove("active");
-      });
+  document
+    .querySelectorAll(".nav-link")
+    .forEach(link => {
+      link.addEventListener("click", () => {
+        document
+          .querySelectorAll(".nav-link")
+          .forEach(item => {
+            item.classList.remove("active");
+          });
 
-      link.classList.add("active");
+        link.classList.add("active");
+      });
     });
-  });
 }
 
 // ---------- INITIALIZATION ----------
@@ -457,7 +615,11 @@ function initializeApp() {
   if (refreshButton) {
     refreshButton.addEventListener("click", () => {
       refreshDashboard();
-      showToast("جاري تحديث بيانات النظام", "info");
+
+      showToast(
+        "جاري تحديث بيانات النظام",
+        "info"
+      );
     });
   }
 
@@ -467,7 +629,12 @@ function initializeApp() {
     refreshDashboard();
   }, 15000);
 
-  console.log("SMC Trading Pro initialized.");
+  console.log(
+    "SMC Trading Pro initialized."
+  );
 }
 
-document.addEventListener("DOMContentLoaded", initializeApp);
+document.addEventListener(
+  "DOMContentLoaded",
+  initializeApp
+);
