@@ -1,8 +1,9 @@
+
 'use strict';
 
 const http = require('http');
 const fs = require('fs');
-const pathModule = require('path');
+const path = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
@@ -10,14 +11,20 @@ const BIQUOTE_API_URL = (process.env.BIQUOTE_API_URL || 'https://biquote.io/api'
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
-const APP_DIR = pathModule.resolve(__dirname, '..', 'app');
+const APP_DIR = path.resolve(__dirname, '..', 'app');
 
 const SYMBOLS = ['XAUUSD', 'XAGUSD'];
 const INTERVALS = ['1m', '5m', '15m', '30m', '1h', '4h', '1d'];
+
 const MAX_QUOTE_AGE_SECONDS = 120;
 const CANDLE_LIMIT = 150;
 const POLL_INTERVAL_MS = 60000;
 const SIGNAL_COOLDOWN_MS = 15 * 60 * 1000;
+
+const SL_DISTANCE = 4.0;
+const TP1_DISTANCE = 5.0;
+const TP2_DISTANCE = 10.0;
+const TP3_DISTANCE = 15.0;
 
 const quoteCache = new Map();
 const candleCache = new Map();
@@ -62,7 +69,7 @@ function ema(values, period) {
 }
 
 function calculateATR(bars, period = 14) {
-  if (bars.length < period + 1) return null;
+  if (!bars || bars.length < period + 1) return null;
 
   const ranges = [];
 
@@ -139,7 +146,9 @@ async function getQuote(symbol) {
       ask >= bid;
 
     const quoteAgeSeconds = Number(raw.quoteAgeSeconds);
-    const marketOpen = String(raw.marketState || '').toLowerCase() === 'open';
+    const marketOpen =
+      String(raw.marketState || '').toLowerCase() === 'open';
+
     const fresh =
       raw.stale !== true &&
       Number.isFinite(quoteAgeSeconds) &&
@@ -154,11 +163,15 @@ async function getQuote(symbol) {
       marketState: raw.marketState || 'unknown',
       marketOpen,
       stale: raw.stale === true,
-      quoteAgeSeconds: Number.isFinite(quoteAgeSeconds) ? quoteAgeSeconds : null,
+      quoteAgeSeconds: Number.isFinite(quoteAgeSeconds)
+        ? quoteAgeSeconds
+        : null,
       fresh,
       tradable: validPrices && marketOpen && fresh,
       lastQuoteAt: raw.lastQuoteAt || null,
-      dayDiffPercent: isNumber(raw.dayDiffPercent) ? Number(raw.dayDiffPercent) : null,
+      dayDiffPercent: isNumber(raw.dayDiffPercent)
+        ? Number(raw.dayDiffPercent)
+        : null,
       direction: raw.direction || 'UNKNOWN',
       high: isNumber(raw.high) ? Number(raw.high) : null,
       low: isNumber(raw.low) ? Number(raw.low) : null,
@@ -169,6 +182,7 @@ async function getQuote(symbol) {
 
     quoteCache.set(symbol, { time: Date.now(), data });
     return data;
+
   } catch (error) {
     if (cached) {
       return {
@@ -296,7 +310,13 @@ function calculateTrend(bars) {
   const atr = calculateATR(bars, 14);
   const rsi = calculateRSI(closes, 14);
 
-  if (!ema20 || !ema50 || !atr || !Number.isFinite(rsi)) {
+  if (
+    ema20 === null ||
+    ema50 === null ||
+    atr === null ||
+    atr <= 0 ||
+    !Number.isFinite(rsi)
+  ) {
     return {
       available: false,
       trend: 'غير متاح',
@@ -310,7 +330,11 @@ function calculateTrend(bars) {
 
   let trend = 'متذبذب';
 
-  if (ema20 > ema50 && closes[closes.length - 1] > ema20 && rsi >= 50) {
+  if (
+    ema20 > ema50 &&
+    closes[closes.length - 1] > ema20 &&
+    rsi >= 50
+  ) {
     trend = 'صاعد';
   } else if (
     ema20 < ema50 &&
@@ -378,7 +402,8 @@ async function analyzeSymbol(symbol) {
   const mainBars = candles['5m'];
   const levels = calculateLevels(mainBars);
 
-  const available = mainBars.length >= 60 &&
+  const available =
+    mainBars.length >= 60 &&
     candles['15m'].length >= 55;
 
   const mainTrend = timeframes['5m'];
@@ -392,7 +417,10 @@ async function analyzeSymbol(symbol) {
     levels,
     timeframes,
     candleCounts: Object.fromEntries(
-      Object.entries(candles).map(([key, value]) => [key, value.length])
+      Object.entries(candles).map(([key, value]) => [
+        key,
+        value.length
+      ])
     ),
     candles
   };
@@ -451,114 +479,108 @@ async function getAnalysis() {
   return data;
 }
 
+/*
+ * محرك Pure Liquidity Sweep
+ * الفاصل المستخدم للإشارات: 5 دقائق.
+ * القمة/القاع: 10 شموع يسار و5 شموع تأكيد يمين.
+ * الدخول: إغلاق شمعة القمة/القاع المؤكدة.
+ */
 function buildSignal(symbol, analysis, quote) {
   if (!quote || !quote.tradable) return null;
-  if (!analysis || !analysis.available) return null;
+  if (!analysis || !analysis.candles) return null;
 
   const bars = analysis.candles['5m'];
-  const bars15 = analysis.candles['15m'];
-  const bars1h = analysis.candles['1h'];
 
-  if (!bars || bars.length < 60 || !bars15 || bars15.length < 55) {
+  if (!Array.isArray(bars) || bars.length < 16) {
     return null;
   }
 
-  const current = bars[bars.length - 1];
-  const previous = bars[bars.length - 2];
+  const currentIndex = bars.length - 1;
+  const pivotIndex = currentIndex - 5;
+  const pivot = bars[pivotIndex];
 
-  const trend5 = analysis.timeframes['5m'];
-  const trend15 = analysis.timeframes['15m'];
-  const trend1h = analysis.timeframes['1h'];
+  if (!pivot) return null;
 
-  if (!trend5.available || !trend15.available) return null;
+  const leftBars = bars.slice(pivotIndex - 10, pivotIndex);
+  const rightBars = bars.slice(pivotIndex + 1, currentIndex + 1);
 
-  const atr = trend5.atr;
-  if (!atr || atr <= 0) return null;
-
-  const recent = bars.slice(-21, -1);
-  const support = Math.min(...recent.map(bar => bar.low));
-  const resistance = Math.max(...recent.map(bar => bar.high));
-
-  const candleRange = current.high - current.low;
-  if (candleRange <= 0) return null;
-
-  const lowerWick = Math.min(current.open, current.close) - current.low;
-  const upperWick = current.high - Math.max(current.open, current.close);
-
-  const bullishCandle = current.close > current.open;
-  const bearishCandle = current.close < current.open;
-
-  const nearSupport = current.low <= support + atr * 0.30;
-  const nearResistance = current.high >= resistance - atr * 0.30;
-
-  const bullishRejection =
-    bullishCandle &&
-    lowerWick / candleRange >= 0.25 &&
-    current.close > previous.close &&
-    nearSupport;
-
-  const bearishRejection =
-    bearishCandle &&
-    upperWick / candleRange >= 0.25 &&
-    current.close < previous.close &&
-    nearResistance;
-
-  const bullishTrend =
-    trend5.trend === 'صاعد' &&
-    trend15.trend === 'صاعد' &&
-    (!trend1h.available || trend1h.trend !== 'هابط');
-
-  const bearishTrend =
-    trend5.trend === 'هابط' &&
-    trend15.trend === 'هابط' &&
-    (!trend1h.available || trend1h.trend !== 'صاعد');
-
-  let side = null;
-
-  if (bullishRejection && bullishTrend) side = 'BUY';
-  if (bearishRejection && bearishTrend) side = 'SELL';
-
-  if (!side) return null;
-
-  const entry = current.close;
-  const swingBars = bars.slice(-7, -1);
-
-  let sl;
-  let risk;
-
-  if (side === 'BUY') {
-    const swingLow = Math.min(...swingBars.map(bar => bar.low));
-    sl = Math.min(swingLow, entry - atr * 1.2);
-    risk = entry - sl;
-  } else {
-    const swingHigh = Math.max(...swingBars.map(bar => bar.high));
-    sl = Math.max(swingHigh, entry + atr * 1.2);
-    risk = sl - entry;
+  if (leftBars.length !== 10 || rightBars.length !== 5) {
+    return null;
   }
 
-  if (!Number.isFinite(risk) || risk <= 0) return null;
+  const previousHighest = Math.max(
+    ...leftBars.map(bar => bar.high)
+  );
 
-  const tp1 = side === 'BUY' ? entry + risk : entry - risk;
-  const tp2 = side === 'BUY' ? entry + risk * 2 : entry - risk * 2;
+  const previousLowest = Math.min(
+    ...leftBars.map(bar => bar.low)
+  );
+
+  const rightHighest = Math.max(
+    ...rightBars.map(bar => bar.high)
+  );
+
+  const rightLowest = Math.min(
+    ...rightBars.map(bar => bar.low)
+  );
+
+  const pivotHigh =
+    pivot.high > previousHighest &&
+    pivot.high > rightHighest;
+
+  const pivotLow =
+    pivot.low < previousLowest &&
+    pivot.low < rightLowest;
+
+  const sweepHigh =
+    pivotHigh &&
+    pivot.high > previousHighest;
+
+  const sweepLow =
+    pivotLow &&
+    pivot.low < previousLowest;
+
+  if (sweepHigh === sweepLow) return null;
+
+  const side = sweepHigh ? 'SELL' : 'BUY';
+  const entry = pivot.close;
+
+  const sl = side === 'SELL'
+    ? pivot.high + SL_DISTANCE
+    : pivot.low - SL_DISTANCE;
+
+  const tp1 = side === 'SELL'
+    ? entry - TP1_DISTANCE
+    : entry + TP1_DISTANCE;
+
+  const tp2 = side === 'SELL'
+    ? entry - TP2_DISTANCE
+    : entry + TP2_DISTANCE;
+
+  const tp3 = side === 'SELL'
+    ? entry - TP3_DISTANCE
+    : entry + TP3_DISTANCE;
 
   const decimals = symbol === 'XAUUSD' ? 2 : 3;
   const round = value => Number(value.toFixed(decimals));
 
   return {
-    id: `${symbol}-${side}-${current.time}`,
+    id: `${symbol}-${side}-${pivot.time}`,
     symbol,
     side,
     type: side === 'BUY' ? 'شراء' : 'بيع',
     entry: round(entry),
+    sl: round(sl),
     tp1: round(tp1),
     tp2: round(tp2),
-    sl: round(sl),
+    tp3: round(tp3),
     timeframe: '5m',
     trend: side === 'BUY' ? 'صاعد' : 'هابط',
     reason: side === 'BUY'
-      ? 'ارتداد صاعد من منطقة دعم مع تأكيد الاتجاه'
-      : 'رفض سعري من منطقة مقاومة مع تأكيد الاتجاه',
-    candleTime: current.time,
+      ? 'اصطياد سيولة أسفل قاع مؤكد بعد خمس شموع'
+      : 'اصطياد سيولة أعلى قمة مؤكدة بعد خمس شموع',
+    candleTime: pivot.time,
+    confirmationTime: bars[currentIndex].time,
     createdAt: new Date().toISOString(),
     status: 'جديدة',
     telegramSent: false
@@ -568,19 +590,28 @@ function buildSignal(symbol, analysis, quote) {
 function validateSignal(signal) {
   if (!signal) return false;
 
-  const values = [signal.entry, signal.tp1, signal.tp2, signal.sl];
+  const values = [
+    signal.entry,
+    signal.tp1,
+    signal.tp2,
+    signal.tp3,
+    signal.sl
+  ];
+
   if (!values.every(Number.isFinite)) return false;
 
   if (signal.side === 'BUY') {
     return signal.sl < signal.entry &&
       signal.tp1 > signal.entry &&
-      signal.tp2 > signal.tp1;
+      signal.tp2 > signal.tp1 &&
+      signal.tp3 > signal.tp2;
   }
 
   if (signal.side === 'SELL') {
     return signal.sl > signal.entry &&
       signal.tp1 < signal.entry &&
-      signal.tp2 < signal.tp1;
+      signal.tp2 < signal.tp1 &&
+      signal.tp3 < signal.tp2;
   }
 
   return false;
@@ -588,10 +619,15 @@ function validateSignal(signal) {
 
 async function sendTelegram(signal) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    return { sent: false, reason: 'إعدادات Telegram غير مكتملة' };
+    return {
+      sent: false,
+      reason: 'إعدادات Telegram غير مكتملة'
+    };
   }
 
-  const direction = signal.side === 'BUY' ? 'شراء 🟢' : 'بيع 🔴';
+  const direction = signal.side === 'BUY'
+    ? 'شراء 🟢'
+    : 'بيع 🔴';
 
   const message = [
     '📊 SMC Trading Pro',
@@ -601,6 +637,7 @@ async function sendTelegram(signal) {
     `سعر الدخول: ${signal.entry}`,
     `الهدف الأول TP1: ${signal.tp1}`,
     `الهدف الثاني TP2: ${signal.tp2}`,
+    `الهدف الثالث TP3: ${signal.tp3}`,
     `وقف الخسارة SL: ${signal.sl}`,
     `الإطار الزمني: ${signal.timeframe}`,
     '',
@@ -633,14 +670,21 @@ async function sendTelegram(signal) {
     }
 
     return { sent: true };
+
   } catch (error) {
-    return { sent: false, reason: error.message };
+    return {
+      sent: false,
+      reason: error.message
+    };
   }
 }
 
 async function publishSignal(signal) {
   if (!validateSignal(signal)) {
-    return { success: false, error: 'بيانات الإشارة غير صحيحة' };
+    return {
+      success: false,
+      error: 'بيانات الإشارة غير صحيحة'
+    };
   }
 
   const quote = await getQuote(signal.symbol);
@@ -656,11 +700,17 @@ async function publishSignal(signal) {
 
   if (previous) {
     if (previous.side === signal.side) {
-      return { success: false, error: 'تم منع تكرار نفس اتجاه الإشارة' };
+      return {
+        success: false,
+        error: 'تم منع تكرار نفس اتجاه الإشارة'
+      };
     }
 
     if (Date.now() - previous.time < SIGNAL_COOLDOWN_MS) {
-      return { success: false, error: 'فترة منع التكرار لم تنتهِ بعد' };
+      return {
+        success: false,
+        error: 'فترة منع التكرار لم تنتهِ بعد'
+      };
     }
   }
 
@@ -670,7 +720,10 @@ async function publishSignal(signal) {
   signal.telegramError = telegram.sent ? null : telegram.reason;
 
   signals.unshift(signal);
-  if (signals.length > 200) signals.length = 200;
+
+  if (signals.length > 200) {
+    signals.length = 200;
+  }
 
   lastSignalBySymbol.set(signal.symbol, {
     side: signal.side,
@@ -686,6 +739,7 @@ async function publishSignal(signal) {
 
 async function runSignalEngine() {
   if (engineBusy) return;
+
   engineBusy = true;
 
   try {
@@ -694,14 +748,15 @@ async function runSignalEngine() {
     const marketData = await getMarketData();
 
     for (const symbol of SYMBOLS) {
-      const quote = marketData.markets.find(item => item.symbol === symbol);
+      const quote = marketData.markets.find(
+        item => item.symbol === symbol
+      );
 
       if (!quote || !quote.tradable) continue;
 
       const analysis = await analyzeSymbol(symbol);
-      if (!analysis.available) continue;
-
       const bars = analysis.candles['5m'];
+
       if (!bars || bars.length < 60) continue;
 
       const latestBar = bars[bars.length - 1];
@@ -712,12 +767,15 @@ async function runSignalEngine() {
       lastProcessedBar.set(symbol, latestBar.time);
 
       const signal = buildSignal(symbol, analysis, quote);
+
       if (!signal) continue;
 
       await publishSignal(signal);
     }
+
   } catch (error) {
     console.error('Signal engine error:', error.message);
+
   } finally {
     engineBusy = false;
   }
@@ -758,15 +816,10 @@ function authorized(req) {
   return supplied === WEBHOOK_SECRET;
 }
 
-/*
- * تقديم ملفات واجهة التطبيق من مجلد app
- * المسار / يفتح index.html
- * والمسارات /app/... تقدم ملفات الواجهة وPWA
- */
-async function serveAppFile(path, res) {
-  const requestedFile = path === '/'
+async function serveAppFile(requestPath, res) {
+  const requestedFile = requestPath === '/'
     ? 'index.html'
-    : path.slice('/app/'.length);
+    : requestPath.slice('/app/'.length);
 
   let decodedFile;
 
@@ -779,12 +832,12 @@ async function serveAppFile(path, res) {
     });
   }
 
-  const filePath = pathModule.resolve(APP_DIR, decodedFile);
-  const relativePath = pathModule.relative(APP_DIR, filePath);
+  const filePath = path.resolve(APP_DIR, decodedFile);
+  const relativePath = path.relative(APP_DIR, filePath);
 
   if (
     relativePath.startsWith('..') ||
-    pathModule.isAbsolute(relativePath)
+    path.isAbsolute(relativePath)
   ) {
     return json(res, 403, {
       success: false,
@@ -794,7 +847,7 @@ async function serveAppFile(path, res) {
 
   try {
     const file = await fs.promises.readFile(filePath);
-    const extension = pathModule.extname(filePath).toLowerCase();
+    const extension = path.extname(filePath).toLowerCase();
 
     const contentTypes = {
       '.html': 'text/html; charset=utf-8',
@@ -810,7 +863,8 @@ async function serveAppFile(path, res) {
     };
 
     res.writeHead(200, {
-      'Content-Type': contentTypes[extension] || 'application/octet-stream',
+      'Content-Type': contentTypes[extension] ||
+        'application/octet-stream',
       'Cache-Control': extension === '.html'
         ? 'no-cache'
         : 'public, max-age=3600',
@@ -818,6 +872,7 @@ async function serveAppFile(path, res) {
     });
 
     return res.end(file);
+
   } catch (error) {
     if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
       return json(res, 404, {
@@ -835,18 +890,21 @@ async function handleRequest(req, res) {
     return json(res, 204, {});
   }
 
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const path = url.pathname;
+  const url = new URL(
+    req.url,
+    `http://${req.headers.host || 'localhost'}`
+  );
 
-  // الصفحة الرئيسية وملفات الواجهة
+  const requestPath = url.pathname;
+
   if (
     req.method === 'GET' &&
-    (path === '/' || path.startsWith('/app/'))
+    (requestPath === '/' || requestPath.startsWith('/app/'))
   ) {
-    return serveAppFile(path, res);
+    return serveAppFile(requestPath, res);
   }
 
-  if (req.method === 'GET' && path === '/api/status') {
+  if (req.method === 'GET' && requestPath === '/api/status') {
     const marketData = await getMarketData();
 
     return json(res, 200, {
@@ -854,23 +912,27 @@ async function handleRequest(req, res) {
       server: 'running',
       provider: 'BiQuote',
       providerConfigured: true,
-      telegramConfigured: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
-      marketOpen: marketData.markets.some(market => market.marketOpen),
+      telegramConfigured: Boolean(
+        TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID
+      ),
+      marketOpen: marketData.markets.some(
+        market => market.marketOpen
+      ),
       allMarketsTradable: marketData.allMarketsTradable,
       lastEngineRun,
       timestamp: new Date().toISOString()
     });
   }
 
-  if (req.method === 'GET' && path === '/api/markets') {
+  if (req.method === 'GET' && requestPath === '/api/markets') {
     return json(res, 200, await getMarketData());
   }
 
-  if (req.method === 'GET' && path === '/api/analysis') {
+  if (req.method === 'GET' && requestPath === '/api/analysis') {
     return json(res, 200, await getAnalysis());
   }
 
-  if (req.method === 'GET' && path === '/api/signals') {
+  if (req.method === 'GET' && requestPath === '/api/signals') {
     const limit = Math.min(
       100,
       Math.max(1, Number(url.searchParams.get('limit') || 20))
@@ -882,7 +944,10 @@ async function handleRequest(req, res) {
     });
   }
 
-  if (req.method === 'POST' && path === '/api/signals/publish') {
+  if (
+    req.method === 'POST' &&
+    requestPath === '/api/signals/publish'
+  ) {
     if (!authorized(req)) {
       return json(res, 401, {
         success: false,
@@ -895,6 +960,7 @@ async function handleRequest(req, res) {
       const result = await publishSignal(body);
 
       return json(res, result.success ? 200 : 400, result);
+
     } catch (error) {
       return json(res, 400, {
         success: false,
@@ -903,7 +969,10 @@ async function handleRequest(req, res) {
     }
   }
 
-  if (req.method === 'POST' && path === '/api/telegram/test') {
+  if (
+    req.method === 'POST' &&
+    requestPath === '/api/telegram/test'
+  ) {
     if (!authorized(req)) {
       return json(res, 401, {
         success: false,
@@ -917,6 +986,7 @@ async function handleRequest(req, res) {
       entry: 0,
       tp1: 0,
       tp2: 0,
+      tp3: 0,
       sl: 0,
       timeframe: 'اختبار',
       reason: 'رسالة اختبار اتصال Telegram'
