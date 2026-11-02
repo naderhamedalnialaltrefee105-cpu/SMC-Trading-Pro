@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -255,7 +256,7 @@
           <div class="panel-header">
             <div>
               <h2>آخر إشارات التداول</h2>
-              <p>إشارات محرك التحليل في الخادم</p>
+              <p>إشارات محرك السيولة المعتمد في الخادم</p>
             </div>
 
             <span class="signal-counter" id="signal-count">0 إشارة</span>
@@ -266,7 +267,7 @@
             <div class="empty-state" id="signals-empty">
               <div class="empty-icon">◈</div>
               <h3>لا توجد إشارات حتى الآن</h3>
-              <p>ستظهر هنا إشارات الشراء والبيع بعد تشغيل محرك التحليل.</p>
+              <p>ستظهر هنا إشارات الشراء والبيع بعد تحقق شروط محرك التحليل.</p>
             </div>
 
           </div>
@@ -279,7 +280,7 @@
           <div class="panel-header">
             <div>
               <h2>سجل التداول</h2>
-              <p>تاريخ إشارات الذهب والفضة</p>
+              <p>تاريخ إشارات الذهب والفضة وأهدافها الثلاثة</p>
             </div>
           </div>
 
@@ -295,6 +296,7 @@
                   <th>الدخول</th>
                   <th>TP1</th>
                   <th>TP2</th>
+                  <th>TP3</th>
                   <th>وقف الخسارة</th>
                 </tr>
               </thead>
@@ -302,7 +304,7 @@
               <tbody id="history-table-body">
 
                 <tr>
-                  <td colspan="7" class="table-empty">
+                  <td colspan="8" class="table-empty">
                     لا توجد بيانات مسجلة
                   </td>
                 </tr>
@@ -344,7 +346,7 @@
 
             <div class="setting-row">
               <span>آخر تحديث</span>
-              <strong id="last-update">--</strong>
+              <strong>راجع حالة بيانات السوق أعلاه</strong>
             </div>
 
           </div>
@@ -356,7 +358,7 @@
       <!-- FOOTER -->
       <footer class="app-footer">
         <p>SMC Trading Pro v1</p>
-        <span>BiQuote + SMC Analysis + Telegram</span>
+        <span>BiQuote + Liquidity Sweep + Telegram</span>
         <small>
           منصة تحليل وإدارة إشارات التداول.
           التداول ينطوي على مخاطر مالية.
