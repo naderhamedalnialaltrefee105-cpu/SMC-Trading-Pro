@@ -140,9 +140,14 @@ function updateMarketCard(symbol, data) {
     ? "gold-change"
     : "silver-change";
 
+  const marketStatusId = isGold
+    ? "gold-market-status"
+    : "silver-market-status";
+
   if (!data || !data.validPrices) {
     setText(priceId, "--");
     setText(changeId, "السعر غير متاح");
+    setText(marketStatusId, "البيانات غير متاحة");
     return;
   }
 
@@ -168,11 +173,13 @@ function updateMarketCard(symbol, data) {
   let statusText = "";
 
   if (data.marketOpen && data.fresh) {
-    statusText = "السوق مفتوح";
+    statusText = "السوق مفتوح والبيانات محدثة";
   } else if (!data.marketOpen) {
     statusText = "السوق مغلق — آخر سعر إغلاق";
   } else if (!data.fresh) {
     statusText = "السعر قديم — الإشارات متوقفة";
+  } else {
+    statusText = "حالة السوق غير محددة";
   }
 
   const trendText =
@@ -184,6 +191,8 @@ function updateMarketCard(symbol, data) {
 
   element.textContent =
     `${statusText} | ${trendText} | ${sign}${changePercent.toFixed(2)}%`;
+
+  setText(marketStatusId, statusText);
 }
 
 async function loadMarkets() {
@@ -223,10 +232,10 @@ async function loadMarkets() {
       markets.every(item => item.tradable === true);
 
     setText(
-      "system-status",
+      "signal-market-status",
       allOpenAndFresh
-        ? "السوق مفتوح والبيانات محدثة"
-        : "الإشارات متوقفة أو البيانات غير مكتملة"
+        ? "جاهز لاستقبال الإشارات"
+        : "متوقف — السوق مغلق أو البيانات قديمة"
     );
 
   } catch (error) {
@@ -234,6 +243,9 @@ async function loadMarkets() {
 
     setText("gold-change", "تعذر جلب بيانات الذهب");
     setText("silver-change", "تعذر جلب بيانات الفضة");
+    setText("gold-market-status", "تعذر جلب البيانات");
+    setText("silver-market-status", "تعذر جلب البيانات");
+    setText("signal-market-status", "تعذر التحقق");
     setText("last-update", "--");
   }
 }
@@ -371,6 +383,7 @@ function renderSignalCard(signal) {
     ["الدخول", signal.entry],
     ["الهدف الأول TP1", signal.tp1],
     ["الهدف الثاني TP2", signal.tp2],
+    ["الهدف الثالث TP3", signal.tp3],
     ["وقف الخسارة SL", signal.sl]
   ];
 
@@ -413,7 +426,7 @@ function renderSignals(signals) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
 
-    cell.colSpan = 7;
+    cell.colSpan = 8;
     cell.className = "table-empty";
     cell.textContent = "لا توجد إشارات مسجلة";
 
@@ -448,6 +461,7 @@ function renderSignals(signals) {
       createCell(formatPrice(signal.entry)),
       createCell(formatPrice(signal.tp1)),
       createCell(formatPrice(signal.tp2)),
+      createCell(formatPrice(signal.tp3)),
       createCell(formatPrice(signal.sl))
     );
 
