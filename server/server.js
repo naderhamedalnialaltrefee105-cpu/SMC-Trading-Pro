@@ -1,4 +1,3 @@
-
 'use strict';
 
 const http = require('http');
@@ -10,21 +9,23 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 const BIQUOTE_API_URL = (process.env.BIQUOTE_API_URL || 'https://biquote.io/api').replace(/\/+$/, '');
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
-
 const APP_DIR = path.resolve(__dirname, '..', 'app');
 
 const SYMBOLS = ['XAUUSD', 'XAGUSD'];
 const INTERVALS = ['1m', '5m', '15m', '30m', '1h', '4h', '1d'];
-
 const MAX_QUOTE_AGE_SECONDS = 120;
 const CANDLE_LIMIT = 150;
 const POLL_INTERVAL_MS = 60000;
 const SIGNAL_COOLDOWN_MS = 15 * 60 * 1000;
+const PIVOT_LEFT = 10;
+const PIVOT_RIGHT = 5;
+const ATR_PERIOD = 14;
+const TARGET_R = [1, 1.5, 2];
 
-const SL_DISTANCE = 4.0;
-const TP1_DISTANCE = 5.0;
-const TP2_DISTANCE = 10.0;
-const TP3_DISTANCE = 15.0;
+const RISK_CONFIG = {
+  XAUUSD: { minStop: 2.0, minBuffer: 0.25, atrStop: 1.0, maxEntryDriftATR: 0.75 },
+  XAGUSD: { minStop: 0.08, minBuffer: 0.015, atrStop: 1.0, maxEntryDriftATR: 0.75 }
+};
 
 const quoteCache = new Map();
 const candleCache = new Map();
@@ -35,6 +36,13 @@ const lastProcessedBar = new Map();
 
 let engineBusy = false;
 let lastEngineRun = null;
+let lastEngineSummary = {
+  status: 'starting',
+  checked: 0,
+  emitted: 0,
+  skipped: 0,
+  details: []
+};
 
 function json(res, status, data) {
   res.writeHead(status, {
@@ -47,29 +55,31 @@ function json(res, status, data) {
 }
 
 function isNumber(value) {
-  return Number.isFinite(Number(value));
+  return value !== null && value !== undefined && value !== '' &&
+    Number.isFinite(Number(value));
 }
 
 function average(values) {
-  if (!values.length) return null;
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
+  return values.length
+    ? values.reduce((a, b) => a + b, 0) / values.length
+    : null;
 }
 
 function ema(values, period) {
-  if (values.length < period) return null;
+  if (!Array.isArray(values) || values.length < period) return null;
 
-  const multiplier = 2 / (period + 1);
-  let result = average(values.slice(0, period));
+  const k = 2 / (period + 1);
+  let value = average(values.slice(0, period));
 
   for (let i = period; i < values.length; i++) {
-    result = (values[i] - result) * multiplier + result;
+    value = (values[i] - value) * k + value;
   }
 
-  return result;
+  return value;
 }
 
-function calculateATR(bars, period = 14) {
-  if (!bars || bars.length < period + 1) return null;
+function calculateATR(bars, period = ATR_PERIOD) {
+  if (!Array.isArray(bars) || bars.length < period + 1) return null;
 
   const ranges = [];
 
@@ -88,25 +98,24 @@ function calculateATR(bars, period = 14) {
 }
 
 function calculateRSI(closes, period = 14) {
-  if (closes.length <= period) return null;
+  if (!Array.isArray(closes) || closes.length <= period) return null;
 
   let gains = 0;
   let losses = 0;
 
   for (let i = closes.length - period; i < closes.length; i++) {
-    const change = closes[i] - closes[i - 1];
+    const difference = closes[i] - closes[i - 1];
 
-    if (change > 0) gains += change;
-    else losses += Math.abs(change);
+    if (difference > 0) gains += difference;
+    else losses += Math.abs(difference);
   }
 
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
+  if (losses === 0) return 100;
+  if (gains === 0) return 0;
 
-  if (avgLoss === 0) return 100;
+  const rs = (gains / period) / (losses / period);
 
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
+  return 100 - 100 / (1 + rs);
 }
 
 async function fetchJSON(url) {
@@ -137,13 +146,8 @@ async function getQuote(symbol) {
     const mid = Number(raw.mid);
 
     const validPrices =
-      Number.isFinite(bid) &&
-      Number.isFinite(ask) &&
-      Number.isFinite(mid) &&
-      bid > 0 &&
-      ask > 0 &&
-      mid > 0 &&
-      ask >= bid;
+      [bid, ask, mid].every(Number.isFinite) &&
+      bid > 0 && ask > 0 && mid > 0 && ask >= bid;
 
     const quoteAgeSeconds = Number(raw.quoteAgeSeconds);
     const marketOpen =
@@ -152,6 +156,7 @@ async function getQuote(symbol) {
     const fresh =
       raw.stale !== true &&
       Number.isFinite(quoteAgeSeconds) &&
+      quoteAgeSeconds >= 0 &&
       quoteAgeSeconds <= MAX_QUOTE_AGE_SECONDS;
 
     const data = {
@@ -181,8 +186,8 @@ async function getQuote(symbol) {
     };
 
     quoteCache.set(symbol, { time: Date.now(), data });
-    return data;
 
+    return data;
   } catch (error) {
     if (cached) {
       return {
@@ -219,7 +224,7 @@ async function getCandles(symbol, interval) {
   const key = `${symbol}_${interval}`;
   const cached = candleCache.get(key);
 
-  if (cached && Date.now() - cached.time < 30000) {
+  if (cached && Date.now() - cached.time < 20000) {
     return cached.bars;
   }
 
@@ -242,14 +247,11 @@ async function getCandles(symbol, interval) {
     }))
     .filter(bar =>
       Number.isFinite(bar.time) &&
-      Number.isFinite(bar.open) &&
-      Number.isFinite(bar.high) &&
-      Number.isFinite(bar.low) &&
-      Number.isFinite(bar.close) &&
+      [bar.open, bar.high, bar.low, bar.close].every(Number.isFinite) &&
       bar.open > 0 &&
-      bar.high >= bar.low &&
       bar.high >= Math.max(bar.open, bar.close) &&
-      bar.low <= Math.min(bar.open, bar.close)
+      bar.low <= Math.min(bar.open, bar.close) &&
+      bar.high >= bar.low
     )
     .sort((a, b) => a.time - b.time);
 
@@ -258,36 +260,42 @@ async function getCandles(symbol, interval) {
   }
 
   candleCache.set(key, { time: Date.now(), bars });
+
   return bars;
 }
 
 function buildThreeMinuteCandles(oneMinuteBars) {
-  const result = [];
   const groups = new Map();
 
   for (const bar of oneMinuteBars) {
     const bucket = Math.floor(bar.time / 180000) * 180000;
 
     if (!groups.has(bucket)) groups.set(bucket, []);
+
     groups.get(bucket).push(bar);
   }
 
-  for (const [time, group] of groups.entries()) {
+  const result = [];
+
+  for (const [time, group] of groups) {
     group.sort((a, b) => a.time - b.time);
 
-    if (group.length !== 3) continue;
-
-    const first = group[0];
-    const last = group[2];
+    if (
+      group.length !== 3 ||
+      group[1].time - group[0].time !== 60000 ||
+      group[2].time - group[1].time !== 60000
+    ) {
+      continue;
+    }
 
     result.push({
       time,
-      open: first.open,
-      high: Math.max(...group.map(bar => bar.high)),
-      low: Math.min(...group.map(bar => bar.low)),
-      close: last.close,
-      volume: group.reduce((sum, bar) => sum + bar.volume, 0),
-      tickVolume: group.reduce((sum, bar) => sum + bar.tickVolume, 0)
+      open: group[0].open,
+      high: Math.max(...group.map(item => item.high)),
+      low: Math.min(...group.map(item => item.low)),
+      close: group[2].close,
+      volume: group.reduce((sum, item) => sum + item.volume, 0),
+      tickVolume: group.reduce((sum, item) => sum + item.tickVolume, 0)
     });
   }
 
@@ -305,18 +313,12 @@ function calculateTrend(bars) {
   }
 
   const closes = bars.map(bar => bar.close);
-  const ema20 = ema(closes, 20);
-  const ema50 = ema(closes, 50);
-  const atr = calculateATR(bars, 14);
-  const rsi = calculateRSI(closes, 14);
+  const e20 = ema(closes, 20);
+  const e50 = ema(closes, 50);
+  const atr = calculateATR(bars);
+  const rsi = calculateRSI(closes);
 
-  if (
-    ema20 === null ||
-    ema50 === null ||
-    atr === null ||
-    atr <= 0 ||
-    !Number.isFinite(rsi)
-  ) {
+  if (![e20, e50, atr, rsi].every(Number.isFinite) || atr <= 0) {
     return {
       available: false,
       trend: 'غير متاح',
@@ -325,34 +327,23 @@ function calculateTrend(bars) {
     };
   }
 
-  const gap = Math.abs(ema20 - ema50);
-  const strength = Math.min(100, Math.round((gap / atr) * 100));
-
   let trend = 'متذبذب';
 
-  if (
-    ema20 > ema50 &&
-    closes[closes.length - 1] > ema20 &&
-    rsi >= 50
-  ) {
+  if (e20 > e50 && closes.at(-1) > e20 && rsi >= 50) {
     trend = 'صاعد';
-  } else if (
-    ema20 < ema50 &&
-    closes[closes.length - 1] < ema20 &&
-    rsi <= 50
-  ) {
+  } else if (e20 < e50 && closes.at(-1) < e20 && rsi <= 50) {
     trend = 'هابط';
   }
 
   return {
     available: true,
     trend,
-    strength,
-    ema20,
-    ema50,
+    strength: Math.min(100, Math.round(Math.abs(e20 - e50) / atr * 100)),
+    ema20: e20,
+    ema50: e50,
     atr,
     rsi,
-    price: closes[closes.length - 1]
+    price: closes.at(-1)
   };
 }
 
@@ -400,27 +391,17 @@ async function analyzeSymbol(symbol) {
   timeframes['3m'].candleCount = candles['3m'].length;
 
   const mainBars = candles['5m'];
-  const levels = calculateLevels(mainBars);
-
-  const available =
-    mainBars.length >= 60 &&
-    candles['15m'].length >= 55;
-
-  const mainTrend = timeframes['5m'];
 
   return {
     symbol,
-    available,
-    trend: mainTrend.trend,
-    strength: mainTrend.strength,
-    indicators: mainTrend,
-    levels,
+    available: mainBars.length >= 60 && candles['15m'].length >= 55,
+    trend: timeframes['5m'].trend,
+    strength: timeframes['5m'].strength,
+    indicators: timeframes['5m'],
+    levels: calculateLevels(mainBars),
     timeframes,
     candleCounts: Object.fromEntries(
-      Object.entries(candles).map(([key, value]) => [
-        key,
-        value.length
-      ])
+      Object.entries(candles).map(([key, value]) => [key, value.length])
     ),
     candles
   };
@@ -430,7 +411,7 @@ async function getAnalysis() {
   const now = Date.now();
   const cached = analysisCache.get('all');
 
-  if (cached && now - cached.time < 30000) {
+  if (cached && now - cached.time < 20000) {
     return cached.data;
   }
 
@@ -440,29 +421,28 @@ async function getAnalysis() {
     getMarketData()
   ]);
 
-  const availableSymbols = [gold, silver].filter(item => item.available);
-
-  const trends = availableSymbols
+  const ready = [gold, silver].filter(item => item.available);
+  const trends = ready
     .map(item => item.trend)
     .filter(trend => trend !== 'غير متاح');
 
-  let overallTrend = 'غير متاح';
+  const up = trends.filter(trend => trend === 'صاعد').length;
+  const down = trends.filter(trend => trend === 'هابط').length;
 
-  if (trends.length) {
-    const bullish = trends.filter(t => t === 'صاعد').length;
-    const bearish = trends.filter(t => t === 'هابط').length;
-
-    if (bullish > bearish) overallTrend = 'صاعد';
-    else if (bearish > bullish) overallTrend = 'هابط';
-    else overallTrend = 'متذبذب';
-  }
+  const overallTrend = !trends.length
+    ? 'غير متاح'
+    : up > down
+      ? 'صاعد'
+      : down > up
+        ? 'هابط'
+        : 'متذبذب';
 
   const data = {
-    available: availableSymbols.length > 0,
-    engineReady: availableSymbols.length > 0,
+    available: ready.length > 0,
+    engineReady: ready.length > 0,
     overallTrend,
-    strength: availableSymbols.length
-      ? Math.round(average(availableSymbols.map(item => item.strength)))
+    strength: ready.length
+      ? Math.round(average(ready.map(item => item.strength)))
       : 0,
     condition: overallTrend === 'متذبذب'
       ? 'السوق متذبذب'
@@ -470,135 +450,179 @@ async function getAnalysis() {
         ? 'بيانات التحليل غير مكتملة'
         : `الاتجاه العام ${overallTrend}`,
     timeframes: gold.timeframes,
-    symbols: { XAUUSD: gold, XAGUSD: silver },
+    symbols: {
+      XAUUSD: gold,
+      XAGUSD: silver
+    },
     markets: marketData.markets,
     timestamp: new Date().toISOString()
   };
 
   analysisCache.set('all', { time: now, data });
+
   return data;
 }
 
-/*
- * محرك Pure Liquidity Sweep
- * الفاصل المستخدم للإشارات: 5 دقائق.
- * القمة/القاع: 10 شموع يسار و5 شموع تأكيد يمين.
- * الدخول: إغلاق شمعة القمة/القاع المؤكدة.
- */
+// تأكيد القمة أو القاع يتم بعد خمس شموع.
+// سعر الدخول هو سعر السوق الحالي، وليس إغلاق شمعة القمة أو القاع القديمة.
 function buildSignal(symbol, analysis, quote) {
-  if (!quote || !quote.tradable) return null;
-  if (!analysis || !analysis.candles) return null;
+  if (!quote || !quote.tradable || !analysis?.candles) {
+    return {
+      signal: null,
+      reason: 'السعر غير متاح أو غير قابل للتداول'
+    };
+  }
 
   const bars = analysis.candles['5m'];
 
-  if (!Array.isArray(bars) || bars.length < 16) {
-    return null;
+  if (
+    !Array.isArray(bars) ||
+    bars.length < PIVOT_LEFT + PIVOT_RIGHT + ATR_PERIOD + 2
+  ) {
+    return {
+      signal: null,
+      reason: 'شموع 5 دقائق غير كافية'
+    };
   }
 
   const currentIndex = bars.length - 1;
-  const pivotIndex = currentIndex - 5;
+  const pivotIndex = currentIndex - PIVOT_RIGHT;
   const pivot = bars[pivotIndex];
 
-  if (!pivot) return null;
+  const left = bars.slice(pivotIndex - PIVOT_LEFT, pivotIndex);
+  const right = bars.slice(pivotIndex + 1, currentIndex + 1);
 
-  const leftBars = bars.slice(pivotIndex - 10, pivotIndex);
-  const rightBars = bars.slice(pivotIndex + 1, currentIndex + 1);
-
-  if (leftBars.length !== 10 || rightBars.length !== 5) {
-    return null;
+  if (
+    !pivot ||
+    left.length !== PIVOT_LEFT ||
+    right.length !== PIVOT_RIGHT
+  ) {
+    return {
+      signal: null,
+      reason: 'بيانات تأكيد القمة أو القاع غير كافية'
+    };
   }
 
-  const previousHighest = Math.max(
-    ...leftBars.map(bar => bar.high)
-  );
+  const priorHigh = Math.max(...left.map(bar => bar.high));
+  const priorLow = Math.min(...left.map(bar => bar.low));
+  const laterHigh = Math.max(...right.map(bar => bar.high));
+  const laterLow = Math.min(...right.map(bar => bar.low));
 
-  const previousLowest = Math.min(
-    ...leftBars.map(bar => bar.low)
-  );
+  const pivotHigh = pivot.high > priorHigh && pivot.high > laterHigh;
+  const pivotLow = pivot.low < priorLow && pivot.low < laterLow;
 
-  const rightHighest = Math.max(
-    ...rightBars.map(bar => bar.high)
-  );
+  const sweepHigh = pivotHigh && pivot.close < priorHigh;
+  const sweepLow = pivotLow && pivot.close > priorLow;
 
-  const rightLowest = Math.min(
-    ...rightBars.map(bar => bar.low)
-  );
-
-  const pivotHigh =
-    pivot.high > previousHighest &&
-    pivot.high > rightHighest;
-
-  const pivotLow =
-    pivot.low < previousLowest &&
-    pivot.low < rightLowest;
-
-  const sweepHigh =
-    pivotHigh &&
-    pivot.high > previousHighest;
-
-  const sweepLow =
-    pivotLow &&
-    pivot.low < previousLowest;
-
-  if (sweepHigh === sweepLow) return null;
+  if (sweepHigh === sweepLow) {
+    return {
+      signal: null,
+      reason: 'لم تتكون قمة أو قاع اصطياد سيولة مؤكد'
+    };
+  }
 
   const side = sweepHigh ? 'SELL' : 'BUY';
-  const entry = pivot.close;
+  const entry = side === 'BUY'
+    ? Number(quote.ask)
+    : Number(quote.bid);
 
-  const sl = side === 'SELL'
-    ? pivot.high + SL_DISTANCE
-    : pivot.low - SL_DISTANCE;
+  const atr = calculateATR(bars, ATR_PERIOD);
 
-  const tp1 = side === 'SELL'
-    ? entry - TP1_DISTANCE
-    : entry + TP1_DISTANCE;
+  if (
+    !Number.isFinite(entry) ||
+    entry <= 0 ||
+    !Number.isFinite(atr) ||
+    atr <= 0
+  ) {
+    return {
+      signal: null,
+      reason: 'تعذر تحديد سعر الدخول أو ATR'
+    };
+  }
 
-  const tp2 = side === 'SELL'
-    ? entry - TP2_DISTANCE
-    : entry + TP2_DISTANCE;
+  const config = RISK_CONFIG[symbol] || RISK_CONFIG.XAUUSD;
+  const drift = Math.abs(entry - pivot.close);
 
-  const tp3 = side === 'SELL'
-    ? entry - TP3_DISTANCE
-    : entry + TP3_DISTANCE;
+  if (drift > atr * config.maxEntryDriftATR) {
+    return {
+      signal: null,
+      reason: 'تم إلغاء الإشارة لأن السعر تحرك بعيداً عن نقطة التأكيد'
+    };
+  }
+
+  const buffer = Math.max(config.minBuffer, atr * 0.15);
+
+  let sl = side === 'BUY'
+    ? pivot.low - buffer
+    : pivot.high + buffer;
+
+  let risk = Math.abs(entry - sl);
+
+  const minimumRisk = Math.max(config.minStop, atr * config.atrStop);
+
+  if (risk < minimumRisk) {
+    sl = side === 'BUY'
+      ? entry - minimumRisk
+      : entry + minimumRisk;
+
+    risk = minimumRisk;
+  }
+
+  if (!Number.isFinite(risk) || risk <= 0 || risk > atr * 3) {
+    return {
+      signal: null,
+      reason: 'مسافة وقف الخسارة غير مناسبة؛ تم رفض الإشارة'
+    };
+  }
 
   const decimals = symbol === 'XAUUSD' ? 2 : 3;
   const round = value => Number(value.toFixed(decimals));
 
-  return {
-    id: `${symbol}-${side}-${pivot.time}`,
+  const target = multiple => side === 'BUY'
+    ? entry + risk * multiple
+    : entry - risk * multiple;
+
+  const signal = {
+    id: `${symbol}-${side}-${pivot.time}-${currentIndex}`,
     symbol,
     side,
     type: side === 'BUY' ? 'شراء' : 'بيع',
     entry: round(entry),
     sl: round(sl),
-    tp1: round(tp1),
-    tp2: round(tp2),
-    tp3: round(tp3),
+    tp1: round(target(TARGET_R[0])),
+    tp2: round(target(TARGET_R[1])),
+    tp3: round(target(TARGET_R[2])),
     timeframe: '5m',
     trend: side === 'BUY' ? 'صاعد' : 'هابط',
     reason: side === 'BUY'
-      ? 'اصطياد سيولة أسفل قاع مؤكد بعد خمس شموع'
-      : 'اصطياد سيولة أعلى قمة مؤكدة بعد خمس شموع',
+      ? 'اصطياد سيولة أسفل قاع مؤكد بعد خمس شموع؛ الدخول بسعر السوق الحالي'
+      : 'اصطياد سيولة أعلى قمة مؤكدة بعد خمس شموع؛ الدخول بسعر السوق الحالي',
     candleTime: pivot.time,
     confirmationTime: bars[currentIndex].time,
     createdAt: new Date().toISOString(),
     status: 'جديدة',
-    telegramSent: false
+    telegramSent: false,
+    riskDistance: round(risk),
+    atr: round(atr),
+    entrySource: side === 'BUY' ? 'ask' : 'bid',
+    quoteAgeSeconds: quote.quoteAgeSeconds
+  };
+
+  return {
+    signal,
+    reason: 'اكتملت شروط الإشارة'
   };
 }
 
 function validateSignal(signal) {
   if (!signal) return false;
 
-  const values = [
-    signal.entry,
-    signal.tp1,
-    signal.tp2,
-    signal.tp3,
-    signal.sl
-  ];
-
-  if (!values.every(Number.isFinite)) return false;
+  if (
+    ![signal.entry, signal.tp1, signal.tp2, signal.tp3, signal.sl]
+      .every(Number.isFinite)
+  ) {
+    return false;
+  }
 
   if (signal.side === 'BUY') {
     return signal.sl < signal.entry &&
@@ -670,7 +694,6 @@ async function sendTelegram(signal) {
     }
 
     return { sent: true };
-
   } catch (error) {
     return {
       sent: false,
@@ -696,22 +719,30 @@ async function publishSignal(signal) {
     };
   }
 
+  const live = signal.side === 'BUY'
+    ? quote.ask
+    : quote.bid;
+
+  if (
+    Math.abs(Number(signal.entry) - live) >
+    Math.max(0.02, live * 0.0005)
+  ) {
+    return {
+      success: false,
+      error: 'سعر الدخول لم يعد قريباً من سعر السوق الحالي'
+    };
+  }
+
   const previous = lastSignalBySymbol.get(signal.symbol);
 
-  if (previous) {
-    if (previous.side === signal.side) {
-      return {
-        success: false,
-        error: 'تم منع تكرار نفس اتجاه الإشارة'
-      };
-    }
-
-    if (Date.now() - previous.time < SIGNAL_COOLDOWN_MS) {
-      return {
-        success: false,
-        error: 'فترة منع التكرار لم تنتهِ بعد'
-      };
-    }
+  if (
+    previous &&
+    Date.now() - previous.time < SIGNAL_COOLDOWN_MS
+  ) {
+    return {
+      success: false,
+      error: 'فترة منع تكرار الإشارات لم تنتهِ بعد'
+    };
   }
 
   const telegram = await sendTelegram(signal);
@@ -742,46 +773,135 @@ async function runSignalEngine() {
 
   engineBusy = true;
 
+  const details = [];
+  let checked = 0;
+  let emitted = 0;
+  let skipped = 0;
+
   try {
     lastEngineRun = new Date().toISOString();
 
     const marketData = await getMarketData();
 
     for (const symbol of SYMBOLS) {
+      checked++;
+
       const quote = marketData.markets.find(
-        item => item.symbol === symbol
+        market => market.symbol === symbol
       );
 
-      if (!quote || !quote.tradable) continue;
+      if (!quote || !quote.tradable) {
+        skipped++;
+        details.push({
+          symbol,
+          result: 'skipped',
+          reason: 'السعر غير متاح أو السوق مغلق أو البيانات قديمة'
+        });
+        continue;
+      }
 
-      const analysis = await analyzeSymbol(symbol);
+      let analysis;
+
+      try {
+        analysis = await analyzeSymbol(symbol);
+      } catch (error) {
+        skipped++;
+        details.push({
+          symbol,
+          result: 'error',
+          reason: error.message
+        });
+        continue;
+      }
+
       const bars = analysis.candles['5m'];
 
-      if (!bars || bars.length < 60) continue;
+      if (!bars || bars.length < 60) {
+        skipped++;
+        details.push({
+          symbol,
+          result: 'skipped',
+          reason: `شموع 5 دقائق غير كافية: ${bars?.length || 0}/60`
+        });
+        continue;
+      }
 
-      const latestBar = bars[bars.length - 1];
-      const previousBarTime = lastProcessedBar.get(symbol);
+      const latest = bars.at(-1);
+      const previous = lastProcessedBar.get(symbol);
 
-      if (previousBarTime === latestBar.time) continue;
+      if (previous === latest.time) {
+        details.push({
+          symbol,
+          result: 'waiting',
+          reason: 'بانتظار إغلاق شمعة 5 دقائق جديدة'
+        });
+        continue;
+      }
 
-      lastProcessedBar.set(symbol, latestBar.time);
+      lastProcessedBar.set(symbol, latest.time);
 
-      const signal = buildSignal(symbol, analysis, quote);
+      const outcome = buildSignal(symbol, analysis, quote);
 
-      if (!signal) continue;
+      if (!outcome.signal) {
+        skipped++;
+        details.push({
+          symbol,
+          result: 'no_signal',
+          reason: outcome.reason
+        });
+        continue;
+      }
 
-      await publishSignal(signal);
+      const result = await publishSignal(outcome.signal);
+
+      if (result.success) {
+        emitted++;
+
+        details.push({
+          symbol,
+          result: 'signal_created',
+          telegramSent: result.telegram.sent,
+          telegramError: result.telegram.reason || null
+        });
+      } else {
+        skipped++;
+
+        details.push({
+          symbol,
+          result: 'rejected',
+          reason: result.error
+        });
+      }
     }
 
+    lastEngineSummary = {
+      status: 'ok',
+      checked,
+      emitted,
+      skipped,
+      details,
+      updatedAt: new Date().toISOString()
+    };
   } catch (error) {
-    console.error('Signal engine error:', error.message);
+    lastEngineSummary = {
+      status: 'error',
+      checked,
+      emitted,
+      skipped,
+      details: [{
+        result: 'engine_error',
+        reason: error.message
+      }],
+      updatedAt: new Date().toISOString()
+    };
 
+    console.error('Signal engine error:', error.message);
   } finally {
     engineBusy = false;
   }
 }
 
-async function readBody(req) {
+function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
 
@@ -817,14 +937,14 @@ function authorized(req) {
 }
 
 async function serveAppFile(requestPath, res) {
-  const requestedFile = requestPath === '/'
+  const requested = requestPath === '/'
     ? 'index.html'
     : requestPath.slice('/app/'.length);
 
-  let decodedFile;
+  let decoded;
 
   try {
-    decodedFile = decodeURIComponent(requestedFile);
+    decoded = decodeURIComponent(requested);
   } catch {
     return json(res, 400, {
       success: false,
@@ -832,13 +952,10 @@ async function serveAppFile(requestPath, res) {
     });
   }
 
-  const filePath = path.resolve(APP_DIR, decodedFile);
-  const relativePath = path.relative(APP_DIR, filePath);
+  const filePath = path.resolve(APP_DIR, decoded);
+  const relative = path.relative(APP_DIR, filePath);
 
-  if (
-    relativePath.startsWith('..') ||
-    path.isAbsolute(relativePath)
-  ) {
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
     return json(res, 403, {
       success: false,
       error: 'غير مسموح'
@@ -847,9 +964,9 @@ async function serveAppFile(requestPath, res) {
 
   try {
     const file = await fs.promises.readFile(filePath);
-    const extension = path.extname(filePath).toLowerCase();
+    const ext = path.extname(filePath).toLowerCase();
 
-    const contentTypes = {
+    const types = {
       '.html': 'text/html; charset=utf-8',
       '.css': 'text/css; charset=utf-8',
       '.js': 'application/javascript; charset=utf-8',
@@ -863,16 +980,14 @@ async function serveAppFile(requestPath, res) {
     };
 
     res.writeHead(200, {
-      'Content-Type': contentTypes[extension] ||
-        'application/octet-stream',
-      'Cache-Control': extension === '.html'
+      'Content-Type': types[ext] || 'application/octet-stream',
+      'Cache-Control': ext === '.html'
         ? 'no-cache'
         : 'public, max-age=3600',
       'Access-Control-Allow-Origin': '*'
     });
 
     return res.end(file);
-
   } catch (error) {
     if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
       return json(res, 404, {
@@ -904,7 +1019,10 @@ async function handleRequest(req, res) {
     return serveAppFile(requestPath, res);
   }
 
-  if (req.method === 'GET' && requestPath === '/api/status') {
+  if (
+    req.method === 'GET' &&
+    requestPath === '/api/status'
+  ) {
     const marketData = await getMarketData();
 
     return json(res, 200, {
@@ -920,19 +1038,29 @@ async function handleRequest(req, res) {
       ),
       allMarketsTradable: marketData.allMarketsTradable,
       lastEngineRun,
+      engine: lastEngineSummary,
       timestamp: new Date().toISOString()
     });
   }
 
-  if (req.method === 'GET' && requestPath === '/api/markets') {
+  if (
+    req.method === 'GET' &&
+    requestPath === '/api/markets'
+  ) {
     return json(res, 200, await getMarketData());
   }
 
-  if (req.method === 'GET' && requestPath === '/api/analysis') {
+  if (
+    req.method === 'GET' &&
+    requestPath === '/api/analysis'
+  ) {
     return json(res, 200, await getAnalysis());
   }
 
-  if (req.method === 'GET' && requestPath === '/api/signals') {
+  if (
+    req.method === 'GET' &&
+    requestPath === '/api/signals'
+  ) {
     const limit = Math.min(
       100,
       Math.max(1, Number(url.searchParams.get('limit') || 20))
@@ -960,7 +1088,6 @@ async function handleRequest(req, res) {
       const result = await publishSignal(body);
 
       return json(res, result.success ? 200 : 400, result);
-
     } catch (error) {
       return json(res, 400, {
         success: false,
@@ -980,7 +1107,7 @@ async function handleRequest(req, res) {
       });
     }
 
-    const testMessage = {
+    const test = {
       symbol: 'SMC Trading Pro',
       side: 'BUY',
       entry: 0,
@@ -992,7 +1119,7 @@ async function handleRequest(req, res) {
       reason: 'رسالة اختبار اتصال Telegram'
     };
 
-    const result = await sendTelegram(testMessage);
+    const result = await sendTelegram(test);
 
     return json(res, result.sent ? 200 : 400, {
       success: result.sent,
@@ -1022,7 +1149,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`SMC Trading Pro running on port ${PORT}`);
-  console.log('Market data source: BiQuote');
+  console.log(`Market data endpoint: ${BIQUOTE_API_URL}`);
   console.log('Supported markets: XAUUSD, XAGUSD');
   console.log(`App directory: ${APP_DIR}`);
 
